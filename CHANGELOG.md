@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.0] — 2026-10-25
+
+### Added
+- **DOM safety layer** (`src/dom/`): Safe wrappers for browser DOM manipulation — `safe-handle.js`, `safe-document.js`, ownership tracking, element budgets, HTML sanitizer, URL policy, event bridge, identity cache, safe timers, and sub-facades for classList, collection, dataset, and style.
+- `browser.js`: Bundle builder for browser environments.
+- `test-browser.js`, `test-dom.js`: Test coverage for the DOM safety layer.
+
+### Changed
+- All core compiler files unchanged from v1.1.0.
+
 ## [1.1.0] — 2026-10-25
 
 ### Added
