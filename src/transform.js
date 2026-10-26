@@ -90,6 +90,11 @@ function walkNode(node) {
     };
   }
 
+  // ── ThisExpression → __safeThis identifier ──
+  if (node.type === 'ThisExpression') {
+    return { type: 'Identifier', name: '__safeThis' };
+  }
+
   // ── Now deep-clone + recurse for everything else ──
 
   var out = {};

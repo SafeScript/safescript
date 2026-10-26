@@ -1,8 +1,8 @@
 # SafeScript
 
-A safe computational subset of JavaScript. **SafeScript is to code, what JSON is to data.**
+**JSON for code.** A safe computational subset of JavaScript.
 
-JSON gave the world a safe way to exchange data. SafeScript does the same for computation. It's a strict subset of JavaScript — no `eval`, no `new`, no globals, no prototype access — that compiles to plain JS. Open a `.safe` file and you see code that's safe to run. The compiler is 41 KB minified (10 KB gzipped). Ship it anywhere, verify locally, no trust needed.
+JSON gave the world a safe way to exchange data. SafeScript does the same for computation. It's a strict subset of JavaScript — no `eval`, no `new`, no globals, no prototype access — that compiles to plain JS and PHP. Open a `.safe` file and you see code that's safe to run. The compiler is ~48 KB minified (~12 KB gzipped). Ship it anywhere, verify locally, no trust needed.
 
 ## Use Cases
 
@@ -24,9 +24,13 @@ const SafeScript = require('safescript');
 const result = await SafeScript.run('return x + y;', { x: 10, y: 20 });
 // → 30
 
-// Only what you inject is accessible
-await SafeScript.run('return typeof Object;', {});  // → 'undefined'
-await SafeScript.run('return Math.sqrt(16);', { Math });  // → 4
+// Safe globals are available by default — no injection needed
+await SafeScript.run('return Math.floor(3.7);');     // → 3
+await SafeScript.run('return JSON.parse("{}");');     // → {} (null-prototype, __proto__ stripped)
+await SafeScript.run('return Object.keys({a:1});');   // → ['a']
+
+// Math.random is deterministic by default (mulberry32 PRNG, seed 0)
+await SafeScript.run('return Math.random();');  // → same value every time
 ```
 
 ```html
@@ -56,12 +60,49 @@ if (logger) logger.log('received', body);
 return db.store(body);
 ```
 
-The header is an optional `/** */` block comment with four directives:
+The header is an optional `/** */` block comment with five directives:
 
 - `@safescript <version>` — language version
 - `@needs <name>: <Type>` — required capability; the host must provide it or refuse to run the file
 - `@uses <name>: <Type>` — optional capability; the host provides it if available, the script checks with `if (name)`
+- `@type <TypeName> { method1, method2 }` — declares a return type and the methods the script intends to call on it
 - `@env <env1>, <env2>` — constrains which environments can run this file (optional, comma-separated)
+
+### Type Declarations
+
+`@type` declarations tell the host which methods on return types the script intends to call. They're purely declarative — they don't change runtime enforcement, but they enable pre-flight validation at `load()` time.
+
+```js
+/**
+ * @safescript 0.2
+ * @needs fetch: function
+ * @needs log: function
+ * @type Response { json, text, status }
+ * @type Stream { get, set, fields }
+ */
+var resp = fetch('/api/data');
+var data = resp.json();
+log(data);
+```
+
+When `load()` processes this header, it checks:
+1. Every `@type` name is registered with the host (via `SafeScript.lib()`)
+2. Every declared method is in the host's `allowMethods` whitelist
+
+This catches mismatches early — before the script runs — rather than failing at the first method call. If a script declares `@type Response { json, text, status }` but the host only allows `json` and `text`, `load()` throws immediately.
+
+### The `.safe` File as a Trust Unit
+
+A `.safe` file is a unit of trust — one set of declarations, one sandbox boundary. Everything about its security posture is visible in a single file:
+
+- **What it needs** (`@needs`) — the injected capabilities
+- **What it optionally uses** (`@uses`) — degradable capabilities
+- **What return types it touches** (`@type`) — methods on host-provided objects
+- **What environment it expects** (`@env`) — runtime constraints
+
+If you want two functions with different access patterns, you put them in two `.safe` files. Each file gets its own scope, its own type declarations, and its own sandbox. The file IS the security boundary.
+
+This is by design. SafeScript protects the **host's** environment — it ensures that user-submitted code can only call what the host explicitly allows. User protection (ensuring the host acts in the user's interest) comes from a different layer entirely — attestations about the host, not constraints in SafeScript. See [Safebots layers](https://safebots.ai/layers.html) for how these layers compose.
 
 ### Self-Contained by Design
 
@@ -98,11 +139,11 @@ Four security barriers, defense in depth:
 
 2. **Runtime property guards** — Bracket access (`obj[key]`) is rewritten to `__at(obj, key)` / `__set(obj, key, val)`, which block prototype-chain properties (`constructor`, `__proto__`, `prototype`, `caller`, `callee`) at runtime, even when keys are computed dynamically.
 
-3. **Global shadowing + strict mode** — Every global (`Object`, `Array`, `console`, `fetch`, etc.) is declared as `undefined` inside the compiled function. Only capabilities you inject via the scope object are accessible. Code always runs in `"use strict"`.
+3. **Global shadowing + safe globals** — Every native global is declared as `undefined` inside the compiled function, then a curated set of safe globals is injected automatically: frozen facade objects for `Math`, `JSON`, `Object`, `Array`, `String`, `Number`, error constructors, and standalone functions like `parseInt` and `encodeURI`. These facades expose only safe static methods — never raw constructors or mutable prototypes. Additional capabilities are injected via the scope object. Code always runs in `"use strict"`.
 
 4. **Execution guards + hooks** — Compile-time injected `__check()` calls enforce timeout and operation limits (hardcoded ceilings: 60s, 100M ops), preventing infinite loops and infinite recursion. Hooks intercept every call to injected scope functions, letting the host throttle resources at the boundary.
 
-With an empty scope, SafeScript is pure computation — no I/O, no side effects, no access to anything outside the function. Capabilities are injected via the scope object using an object-capability model.
+With an empty scope, SafeScript is pure computation with safe globals — deterministic math, JSON handling, type checking — but no I/O, no side effects, no access to anything outside the function. Additional capabilities are injected via the scope object using an object-capability model.
 
 ## Execution Model
 
@@ -143,6 +184,15 @@ This means `async` and `await` are **not** keywords in SafeScript — they are b
 
 1. **Promises resolve automatically.** When injected objects return Promises, they're awaited at every call site. No unresolved Promises can leak through.
 2. **Sequential execution is guaranteed.** There are no concurrent in-flight operations inside a single SafeScript execution. Throughput comes from running many SafeScript instances in parallel (like PHP-FPM workers), not from concurrency within one.
+3. **Transparent cross-context proxying.** Because every external call is awaited, SafeScript code can run in a WebWorker while the scope objects proxy calls to the main thread via `postMessage`. The SafeScript source doesn't change — it was already written as synchronous-looking code, and the compiler already awaits every call. This means a host like Q.Safebox can move untrusted script execution off the main thread with zero code changes to the `.safe` files.
+
+```js
+// Same SafeScript source works identically whether scope is local or proxied:
+var el = createElement("div")    // <- auto-awaited, works if createElement
+setText(el, "Hello")             //    returns a value OR a Promise
+appendTo(el, container)          //    (e.g. from a MessageChannel proxy)
+return getText(el)
+```
 
 ### Execution Guards
 
@@ -230,6 +280,176 @@ var result = await SafeScript.run(handlerSource, { utils, db, request });
 
 This keeps each `.safe` file self-contained while allowing the host to compose them freely. The host controls the dependency graph, not the scripts.
 
+## Safe Globals
+
+SafeScript provides a set of frozen facade objects available in every execution — no injection needed. These are safe subsets of their JavaScript counterparts: only static methods, no constructors, no mutable prototypes.
+
+| Global | What's available |
+|--------|-----------------|
+| `Object` | `keys`, `values`, `entries`, `assign`, `freeze`, `isFrozen`, `getOwnPropertyNames`, `create` (null only) |
+| `Array` | `isArray`, `from`, `of` |
+| `String` | `fromCharCode`, `fromCodePoint` |
+| `Number` | `isInteger`, `isFinite`, `isNaN`, `parseInt`, `parseFloat`, `MAX_SAFE_INTEGER`, `MIN_SAFE_INTEGER`, `EPSILON`, `MAX_VALUE`, `MIN_VALUE`, `POSITIVE_INFINITY`, `NEGATIVE_INFINITY`, `NaN` |
+| `Math` | All standard methods. `Math.random` is deterministic by default (see below). |
+| `JSON` | `parse` (sanitized — output uses null-prototype objects, `__proto__` keys stripped), `stringify` |
+| `Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError` | Constructors (usable with `throw`) |
+| Standalone | `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `encodeURI`, `decodeURI`, `encodeURIComponent`, `decodeURIComponent` |
+| Constants | `NaN`, `Infinity` |
+
+All facade objects are deeply frozen. Attempts to modify them (e.g. `Math.PI = 3`) silently fail in strict mode. `Object.create` is restricted to `Object.create(null)` — passing any other argument throws.
+
+### JSON.parse Sanitization
+
+`JSON.parse` output is deep-walked to convert all objects to null-prototype objects and strip any `__proto__` keys. This prevents prototype pollution attacks through parsed JSON data.
+
+## Deterministic RNG
+
+`Math.random` uses a mulberry32 PRNG seeded per invocation. By default, the seed is `0`, so every call to `run()` produces the same sequence of random numbers. This makes SafeScript executions fully reproducible.
+
+```js
+// Deterministic — same result every time
+await SafeScript.run('return Math.random();');  // → always 0.2267...
+
+// Custom seed
+await SafeScript.run('return Math.random();', {}, { seed: 42 });  // → always 0.0020...
+
+// True randomness (requires host approval)
+await SafeScript.run('return Math.random();', {}, {
+  seed: null,
+  env: { Random: true }
+});
+```
+
+The `seed` option controls behavior:
+
+| `seed` value | Behavior |
+|---|---|
+| omitted / `undefined` | Deterministic, seed = 0 |
+| any integer | Deterministic, that seed |
+| `null` | True `Math.random` — requires `env: { Random: true }` |
+
+Setting `seed: null` without `env: { Random: true }` throws: `SafeScript: seed: null requires env: { Random: true } (nondeterministic RNG needs host approval)`. This ensures nondeterminism is always an explicit host decision.
+
+## Library Registration
+
+Hosts can register named libraries that `load()` auto-resolves for `@needs` and `@uses` declarations. This avoids repeating resolver logic for common capabilities.
+
+```js
+// Register libraries once at startup
+SafeScript.lib('http', myHttpClient);
+SafeScript.lib('db', myDbAdapter);
+
+// Scripts that @needs http or @needs db get them automatically
+var bundle = await SafeScript.load(source);  // no resolver needed
+await SafeScript.run(bundle);
+
+// Resolver scope takes precedence over registered libs
+var bundle = await SafeScript.load(source, function(caps) {
+  return { http: customHttpClient };  // overrides registered 'http'
+});
+
+// Manage registrations
+SafeScript.libs();       // → ['http', 'db']
+SafeScript.unlib('db');  // unregister
+```
+
+Unregistered `@needs` still throw `Missing capabilities` if no resolver provides them.
+
+## Type Registry
+
+When host functions return objects, those objects carry methods. Without registration, SafeScript blocks all method calls on unknown types — a sandbox violation. The type registry lets the host declare exactly which methods are safe to call.
+
+```js
+// Register a type with its allowed methods
+SafeScript.lib(Counter, { allowMethods: ['value', 'increment', 'toString'] });
+
+// Now SafeScript code can call those methods — and only those
+var result = await SafeScript.run('return c.value()', { c: new Counter(42) });
+// → 42
+
+// Blocked methods throw
+await SafeScript.run('c.reset()', { c: new Counter(0) });
+// → Error: SafeScript: method "reset" not allowed on Counter
+
+// Unregistered types block everything
+await SafeScript.run('return x.anything()', { x: new SomeClass() });
+// → Error: SafeScript: cannot call method on unregistered type
+```
+
+### Named Type Registration (for `@type` headers)
+
+The three-argument form registers both a string name (for `@type` header validation) and a constructor (for runtime enforcement):
+
+```js
+// Three-arg: lib(name, Constructor, config)
+SafeScript.lib('Response', ResponseClass, { allowMethods: ['json', 'text', 'status'] });
+SafeScript.lib('Stream', StreamClass, { allowMethods: ['get', 'set', 'fields'] });
+
+// Now @type Response { json, text } in a .safe header validates at load() time
+var bundle = await SafeScript.load(source);  // checks @type declarations
+await SafeScript.run(bundle);
+```
+
+### How It Works
+
+The runtime checks every method call through a dispatch chain:
+
+1. **Primitives** (string, number, boolean) → allow all native methods
+2. **Arrays** → allow all native methods
+3. **Functions** → allow all (call, apply, bind)
+4. **Plain objects** → allow callable properties only
+5. **Error family** → allow all (toString, message, etc.)
+6. **Registered types** → check allowMethods whitelist
+7. **Unregistered types** → throw (sandbox violation)
+
+Subclass inheritance works automatically — a `SpecialCounter extends Counter` instance uses the `Counter` registration if `SpecialCounter` isn't registered independently.
+
+```js
+// Unregister
+SafeScript.unlib(Counter);
+
+// Clear all type registrations
+// (accessible through runtime internals)
+```
+
+## `this` and Facades
+
+SafeScript supports `this` as a keyword. It compiles to an internal `__safeThis` identifier via a mutable cell pattern. By default, `this` is `undefined` everywhere — top level, regular functions, and arrows.
+
+The host controls what `this` resolves to through the `facades` option. Facades let injected callback-accepting functions set `this` for the callbacks they receive.
+
+```js
+var result = await SafeScript.run(`
+  Q.Tool.define("my-tool", {
+    init: function() {
+      // 'this' is the facade object created by createToolFacade
+      this.state.count = 0;
+    },
+    methods: {
+      increment: function() {
+        this.state.count = this.state.count + 1;
+      }
+    }
+  });
+`, { Q: myQObject }, {
+  facades: {
+    'Q.Tool.define': {
+      args: [1],        // callback argument indices
+      methods: [3],     // method-object argument indices (values are wrapped)
+      create: function(name) { return { state: {}, element: null }; }
+    }
+  }
+});
+```
+
+Facade config fields:
+
+- `args` — indices of arguments that are callbacks (will have `this` set to the facade)
+- `methods` — indices of arguments that are objects whose values are callbacks
+- `create` — factory function called with the other arguments to build the facade object
+
+All property access on `this` goes through the same `__at`/`__set` guards as any other object — `constructor`, `__proto__`, and `prototype` are blocked.
+
 ## API
 
 ### `SafeScript.run(source, scope?, opts?)` or `SafeScript.run(bundle)`
@@ -248,6 +468,9 @@ Options:
 - `timeout: N` — execution timeout in milliseconds (capped at 60000). Always enforced even if omitted.
 - `maxOps: N` — maximum operations / guard checks (capped at 100000000). Always enforced even if omitted.
 - `hooks: { beforeCall, afterCall }` — intercept calls to injected scope functions. See [Hooks](#hooks).
+- `seed: N` — PRNG seed. Default `0` (deterministic). Any integer for a custom seed. `null` for true `Math.random` (requires `env: { Random: true }`).
+- `env: { Random: true }` — approve environment capabilities. Currently only `Random` is defined.
+- `facades: { ... }` — per-method `this` facades. See [`this` and Facades](#this-and-facades).
 
 ### `SafeScript.compile(source)`
 
@@ -259,7 +482,7 @@ Returns `{ ok: boolean, errors: Array|null }`. Check without executing.
 
 ### `SafeScript.capabilities(source)`
 
-Returns `{ version, env, needs: [{name, type}], uses: [{name, type}] }`. Parse the `.safe` file header.
+Returns `{ version, env, needs: [{name, type}], uses: [{name, type}], types: [{name, methods}] }`. Parse the `.safe` file header.
 
 ### `SafeScript.load(source, resolver?)`
 
@@ -298,13 +521,32 @@ Returns the AST (ESTree-like).
 
 Deep-copies an object to null-prototype objects, blocking prototype-chain escapes.
 
+### `SafeScript.lib(name, value)` / `SafeScript.lib(Constructor, config)` / `SafeScript.lib(name, Constructor, config)`
+
+Three forms:
+- `lib(name, value)` — register a named library (auto-resolved by `load()` for `@needs`/`@uses`)
+- `lib(Constructor, { allowMethods: [...] })` — register a type whitelist for runtime method enforcement
+- `lib(name, Constructor, { allowMethods: [...] })` — register both a named type (for `@type` header validation) and a constructor whitelist (for runtime enforcement)
+
+### `SafeScript.unlib(name)` / `SafeScript.unlib(Constructor)`
+
+Unregister a named library, a type registration, or a named type mapping.
+
+### `SafeScript.libs()`
+
+Returns an array of registered library names.
+
+### `SafeScript.clearTypeRegistry()`
+
+Clear all type registrations (both constructor whitelists and named type mappings).
+
 ## What's Allowed
 
 SafeScript supports a broad computational subset of ES2020:
 
 - Variables: `var`, `let`, `const`
 - Control flow: `if`/`else`, `for`, `for-in`, `for-of`, `while`, `do-while`, `switch`/`case`, `break`, `continue`, `return`, labeled statements
-- Functions: declarations, expressions, arrows, default params, rest params
+- Functions: declarations, expressions, arrows, default params, rest params, `this` (via facades)
 - Expressions: all arithmetic, comparison, logical, ternary, `typeof`, `void`, `instanceof`, nullish coalescing (`??`), optional chaining (`?.`)
 - Destructuring: array and object patterns, rest elements, nested
 - Spread: arrays and objects
@@ -328,9 +570,9 @@ See [Examples.md](Examples.md) for a kitchen-sink collection: basics, control fl
 
 | Build | Size |
 |-------|------|
-| `safescript.js` | ~77 KB |
-| `safescript.min.js` | ~41 KB |
-| gzipped | ~10 KB |
+| `safescript.js` | ~94 KB |
+| `safescript.min.js` | ~48 KB |
+| gzipped | ~12 KB |
 
 ## Ecosystem
 
@@ -352,6 +594,8 @@ node test-compiler.js      # compiler pipeline
 node test-battle.js        # adversarial/escape attempts
 node test-header.js        # header parser + load() + run(bundle)
 node test-guards-hooks.js  # execution guards + hooks system
+node test-type-registry.js # type registry — method whitelisting
+node test-type-header.js   # @type header declarations + load() validation
 ```
 
 ## License

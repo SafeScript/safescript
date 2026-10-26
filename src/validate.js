@@ -125,6 +125,10 @@ function validate(ast) {
         }
         break;
 
+      case 'ThisExpression':
+        // Allowed — will be transformed to __safeThis
+        break;
+
       case 'MemberExpression':
         walk(node.object);
         if (node.computed) {

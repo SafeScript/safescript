@@ -345,7 +345,7 @@ Tokenizer.prototype._lastIsExprEnd = function() {
   if (last.type === TT.Ident || last.type === TT.Number ||
       last.type === TT.String || last.type === TT.Regex) return true;
   if (last.type === TT.Keyword && (last.value === 'true' || last.value === 'false' ||
-      last.value === 'null' || last.value === 'undefined')) return true;
+      last.value === 'null' || last.value === 'undefined' || last.value === 'this')) return true;
   if (last.type === TT.Punct && (last.value === ')' || last.value === ']')) return true;
   return false;
 };
@@ -1035,6 +1035,12 @@ Parser.prototype._parsePrimary = function() {
   if (t.type === TT.Keyword && t.value === 'async' &&
       this._peek(1) && this._peek(1).type === TT.Keyword && this._peek(1).value === 'function') {
     return this._parseFunctionExpr(true);
+  }
+
+  // this expression
+  if (t.type === TT.Keyword && t.value === 'this') {
+    this.pos++;
+    return { type: 'ThisExpression', loc: { line: t.line, col: t.col } };
   }
 
   // Identifier (might be start of arrow: x => ...)

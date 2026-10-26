@@ -33,13 +33,13 @@ function emit(node) {
       return 'async function ' +
         (node.id ? emit(node.id) : '') +
         '(' + node.params.map(emitParam).join(', ') + ') ' +
-        emitBodyWithCheck(node.body);
+        emitFuncBodyWithCheck(node.body);
 
     case 'FunctionExpression':
       return 'async function' +
         (node.id ? ' ' + emit(node.id) : '') +
         '(' + node.params.map(emitParam).join(', ') + ') ' +
-        emitBodyWithCheck(node.body);
+        emitFuncBodyWithCheck(node.body);
 
     case 'ArrowFunctionExpression':
       var paramsStr;
@@ -125,6 +125,9 @@ function emit(node) {
     case 'Identifier':
       return node.name;
 
+    case 'ThisExpression':
+      return '__safeThis';
+
     case 'Literal':
       return node.raw;
 
@@ -168,6 +171,18 @@ function emit(node) {
       return '(' + node.expressions.map(emit).join(', ') + ')';
 
     case 'CallExpression':
+      // Method call on non-computed member: obj.method(args) → __call(obj, "method", args)
+      if (node.callee.type === 'MemberExpression' && !node.callee.computed) {
+        var objStr = emit(node.callee.object);
+        var methodName = node.callee.property.name || node.callee.property.value;
+        var callFn = node.callee.optional ? '__call_opt' : '__call';
+        var callArgs = [objStr, '"' + methodName + '"'];
+        node.arguments.forEach(function(a) {
+          if (a.type === 'SpreadElement') callArgs.push('...' + emit(a.argument));
+          else callArgs.push(emit(a));
+        });
+        return '(await ' + callFn + '(' + callArgs.join(', ') + '))';
+      }
       var calleeStr = emit(node.callee);
       // Wrap arrow/function expression callees in parens for IIFE
       if (node.callee.type === 'ArrowFunctionExpression' ||
@@ -201,7 +216,7 @@ function emit(node) {
         if (prop.method) {
           var fn = prop.value;
           return 'async ' + (prop.computed ? '[' + emit(prop.key) + ']' : emit(prop.key)) +
-            '(' + fn.params.map(emitParam).join(', ') + ') ' + emitBodyWithCheck(fn.body);
+            '(' + fn.params.map(emitParam).join(', ') + ') ' + emitFuncBodyWithCheck(fn.body);
         }
         var keyStr = prop.computed ? '[' + emit(prop.key) + ']' : emit(prop.key);
         return keyStr + ': ' + emit(prop.value);
@@ -218,10 +233,21 @@ function emit(node) {
 
 /**
  * Emit a function body block with __check() at the top.
- * Used for FunctionDeclaration, FunctionExpression, ArrowFunctionExpression, object methods.
+ * Used for ArrowFunctionExpression (no __safeThis preamble — inherits from enclosing scope).
  */
 function emitBodyWithCheck(blockNode) {
   return '{\n__check();\n' + blockNode.body.map(emit).join('\n') + '\n}';
+}
+
+/**
+ * Emit a regular function body with __safeThis capture preamble.
+ * Used for FunctionDeclaration, FunctionExpression, object methods.
+ * Captures __safeThis from __thisCell, then resets the cell.
+ * Arrow functions do NOT get this — they inherit __safeThis lexically.
+ */
+function emitFuncBodyWithCheck(blockNode) {
+  return '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n__check();\n' +
+    blockNode.body.map(emit).join('\n') + '\n}';
 }
 
 /**

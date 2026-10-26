@@ -12,7 +12,9 @@ var BLOCKED = Object.create(null);
   '__defineGetter__', '__defineSetter__',
   '__lookupGetter__', '__lookupSetter__',
   // Self-reference, stack walking
-  'this', 'arguments', 'callee', 'caller',
+  'arguments', 'callee', 'caller',
+  // Internal runtime identifiers (must not be shadowed by user code)
+  '__safeThis', '__thisCell', '__safeGlobals',
   // Code generation
   'eval', 'Function',
   // Browser globals
@@ -49,6 +51,7 @@ var ALLOWED_KW = Object.create(null);
   'typeof', 'void', 'in', 'of',
   'true', 'false', 'null', 'undefined',
   'instanceof',
+  'this',
 ].forEach(function(k) { ALLOWED_KW[k] = 1; });
 
 // Blocked property names for __at / __set runtime checks

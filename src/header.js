@@ -6,6 +6,7 @@
  *   @env <env1>, <env2>, ...
  *   @needs <name>: <Type>
  *   @uses <name>: <Type>
+ *   @type TypeName { method1, method2 }
  */
 'use strict';
 
@@ -36,7 +37,8 @@ function parseHeader(source) {
     version: null,
     env: null,
     needs: [],
-    uses: []
+    uses: [],
+    types: []
   };
 
   var text = extractHeader(source);
@@ -87,6 +89,14 @@ function parseHeader(source) {
     m = line.match(/^@uses\s+(\w+)\s*$/);
     if (m) {
       result.uses.push({ name: m[1], type: null });
+      continue;
+    }
+
+    // @type TypeName { method1, method2 }
+    m = line.match(/^@type\s+(\w+)\s*\{\s*([^}]*)\}/);
+    if (m) {
+      var methods = m[2].split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+      result.types.push({ name: m[1], methods: methods });
       continue;
     }
   }
