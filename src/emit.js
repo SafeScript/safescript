@@ -7,27 +7,170 @@
  */
 'use strict';
 
+// Debug mode state — set by emitDebug(), read by emit helpers
+var _debugMode = false;
+var _debugLocals = null; // stack of variable-name sets per scope level
+
+/**
+ * Collect variable names declared in an AST node (non-recursive into functions).
+ * Used to build the locals closure for __dbg checkpoints.
+ */
+function collectDeclaredNames(node, names) {
+  if (!node) return;
+  switch (node.type) {
+    case 'VariableDeclaration':
+      for (var i = 0; i < node.declarations.length; i++) {
+        collectPatternNames(node.declarations[i].id, names);
+      }
+      break;
+    case 'FunctionDeclaration':
+      if (node.id) names[node.id.name] = true;
+      // Don't recurse into function body — different scope
+      break;
+    case 'BlockStatement':
+    case 'Program':
+      for (var j = 0; j < node.body.length; j++) {
+        collectDeclaredNames(node.body[j], names);
+      }
+      break;
+    case 'ForStatement':
+      collectDeclaredNames(node.init, names);
+      collectDeclaredNames(node.body, names);
+      break;
+    case 'ForInStatement':
+    case 'ForOfStatement':
+      collectDeclaredNames(node.left, names);
+      collectDeclaredNames(node.body, names);
+      break;
+    case 'WhileStatement':
+    case 'DoWhileStatement':
+      collectDeclaredNames(node.body, names);
+      break;
+    case 'IfStatement':
+      collectDeclaredNames(node.consequent, names);
+      if (node.alternate) collectDeclaredNames(node.alternate, names);
+      break;
+    case 'TryStatement':
+      collectDeclaredNames(node.block, names);
+      if (node.handler) {
+        // Don't collect the catch parameter — it's block-scoped to the catch body
+        collectDeclaredNames(node.handler.body, names);
+      }
+      if (node.finalizer) collectDeclaredNames(node.finalizer, names);
+      break;
+    case 'SwitchStatement':
+      for (var k = 0; k < node.cases.length; k++) {
+        var c = node.cases[k];
+        for (var l = 0; l < c.consequent.length; l++) {
+          collectDeclaredNames(c.consequent[l], names);
+        }
+      }
+      break;
+    case 'LabeledStatement':
+      collectDeclaredNames(node.body, names);
+      break;
+  }
+}
+
+function collectPatternNames(pat, names) {
+  if (!pat) return;
+  switch (pat.type) {
+    case 'Identifier': names[pat.name] = true; break;
+    case 'ArrayPattern':
+      for (var i = 0; i < pat.elements.length; i++) {
+        if (pat.elements[i]) collectPatternNames(pat.elements[i], names);
+      }
+      break;
+    case 'ObjectPattern':
+      for (var j = 0; j < pat.properties.length; j++) {
+        var p = pat.properties[j];
+        if (p.type === 'RestElement') collectPatternNames(p.argument, names);
+        else collectPatternNames(p.value, names);
+      }
+      break;
+    case 'AssignmentPattern': collectPatternNames(pat.left, names); break;
+    case 'RestElement': collectPatternNames(pat.argument, names); break;
+  }
+}
+
+/**
+ * Build the __dbg checkpoint call for after a statement.
+ * @param {number} line - 1-indexed source line
+ * @returns {string} The checkpoint code
+ */
+function emitDbgCheckpoint(line) {
+  if (!_debugMode || !_debugLocals) return '';
+  var names = Object.keys(_debugLocals);
+  var localsObj = names.length > 0
+    ? '{ ' + names.map(function(n) { return n + ': ' + n; }).join(', ') + ' }'
+    : '{}';
+  return '\n__r = await __dbg(' + line + ', function(){ return ' + localsObj + '; });\nif (__r) return __r.value;';
+}
+
+/**
+ * Get the source line from a node (if available).
+ * Walks into child nodes to find the first loc.
+ */
+function nodeLine(node) {
+  if (!node) return 0;
+  if (node.line) return node.line;
+  if (node.loc) return node.loc.line || 0;
+  // Walk into common child structures to find position
+  if (node.declarations && node.declarations[0]) {
+    var d = node.declarations[0];
+    if (d.id && d.id.loc) return d.id.loc.line;
+  }
+  if (node.expression) return nodeLine(node.expression);
+  if (node.argument) return nodeLine(node.argument);
+  if (node.test) return nodeLine(node.test);
+  if (node.callee) return nodeLine(node.callee);
+  if (node.id) return nodeLine(node.id);
+  if (node.left) return nodeLine(node.left);
+  if (node.object) return nodeLine(node.object);
+  return 0;
+}
+
 function emit(node) {
   if (!node) return '';
 
   switch (node.type) {
     case 'Program':
+      if (_debugMode) {
+        return emitStatementsWithDbg(node.body);
+      }
       return node.body.map(emit).join('\n');
 
     case 'ExpressionStatement':
-      return emit(node.expression) + ';';
+      var exprCode = emit(node.expression) + ';';
+      if (_debugMode) {
+        exprCode += emitDbgCheckpoint(nodeLine(node));
+      }
+      return exprCode;
 
     case 'BlockStatement':
+      if (_debugMode) {
+        return '{\n' + emitStatementsWithDbg(node.body) + '\n}';
+      }
       return '{\n' + node.body.map(emit).join('\n') + '\n}';
 
     case 'EmptyStatement':
       return ';';
 
     case 'VariableDeclaration':
-      return node.kind + ' ' + node.declarations.map(function(d) {
+      // In debug mode, register new variable names into _debugLocals
+      if (_debugMode && _debugLocals) {
+        for (var vi = 0; vi < node.declarations.length; vi++) {
+          collectPatternNames(node.declarations[vi].id, _debugLocals);
+        }
+      }
+      var varCode = node.kind + ' ' + node.declarations.map(function(d) {
         if (d.init) return emitPattern(d.id) + ' = ' + emit(d.init);
         return emitPattern(d.id);
       }).join(', ') + ';';
+      if (_debugMode) {
+        varCode += emitDbgCheckpoint(nodeLine(node));
+      }
+      return varCode;
 
     case 'FunctionDeclaration':
       return 'async function ' +
@@ -55,9 +198,19 @@ function emit(node) {
       return 'async ' + paramsStr + ' => ' + emitBodyWithCheck(node.body);
 
     case 'ReturnStatement':
+      if (_debugMode && node.argument) {
+        // Emit: var __retVal = <expr>; __dbg checkpoint; return __retVal;
+        return 'var __retVal = ' + emit(node.argument) + ';' +
+          emitDbgCheckpoint(nodeLine(node)) + '\nreturn __retVal;';
+      }
       return node.argument ? 'return ' + emit(node.argument) + ';' : 'return;';
 
     case 'ThrowStatement':
+      if (_debugMode) {
+        // Emit checkpoint before throw
+        return '{ var __throwVal = ' + emit(node.argument) + ';' +
+          emitDbgCheckpoint(nodeLine(node)) + '\nthrow __throwVal; }';
+      }
       return 'throw ' + emit(node.argument) + ';';
 
     case 'BreakStatement':
@@ -245,6 +398,9 @@ function emit(node) {
  * Used for ArrowFunctionExpression (no __safeThis preamble — inherits from enclosing scope).
  */
 function emitBodyWithCheck(blockNode) {
+  if (_debugMode) {
+    return '{\n' + emitStatementsWithDbg(blockNode.body) + '\n}';
+  }
   return '{\n__check();\n' + blockNode.body.map(emit).join('\n') + '\n}';
 }
 
@@ -255,19 +411,45 @@ function emitBodyWithCheck(blockNode) {
  * Arrow functions do NOT get this — they inherit __safeThis lexically.
  */
 function emitFuncBodyWithCheck(blockNode) {
+  if (_debugMode) {
+    return '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n' +
+      emitStatementsWithDbg(blockNode.body) + '\n}';
+  }
   return '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n__check();\n' +
     blockNode.body.map(emit).join('\n') + '\n}';
 }
 
 /**
  * Emit a loop body with __check() at the start of each iteration.
+ * In debug mode, uses __dbg checkpoint instead.
  * Handles both block and single-statement bodies.
  */
 function emitLoopBody(bodyNode) {
+  if (_debugMode) {
+    if (bodyNode.type === 'BlockStatement') {
+      return '{\n' + emitStatementsWithDbg(bodyNode.body) + '\n}';
+    }
+    return '{\n' + emit(bodyNode) + '\n}';
+  }
   if (bodyNode.type === 'BlockStatement') {
     return '{\n__check();\n' + bodyNode.body.map(emit).join('\n') + '\n}';
   }
   return '{\n__check();\n' + emit(bodyNode) + '\n}';
+}
+
+/**
+ * Emit a list of statements, each followed by a __dbg checkpoint.
+ * (Debug mode only.)
+ */
+function emitStatementsWithDbg(stmts) {
+  var parts = [];
+  for (var i = 0; i < stmts.length; i++) {
+    parts.push(emit(stmts[i]));
+    // The individual emit() cases for ExpressionStatement, VariableDeclaration,
+    // ReturnStatement, ThrowStatement already add checkpoints.
+    // Other statement types (if, for, while, etc.) have checkpoints in their bodies.
+  }
+  return parts.join('\n');
 }
 
 function emitPattern(node) {
@@ -306,4 +488,30 @@ function emitVarDeclNoSemi(node) {
   }).join(', ');
 }
 
+/**
+ * Emit in debug mode: inserts __dbg checkpoints after every statement.
+ * Adds `var __r;` preamble for the checkpoint return-signal variable.
+ * Collects all declared variable names for the locals closure.
+ */
+function emitDebug(node) {
+  // Collect all variable names declared in the program
+  var names = Object.create(null);
+  if (node.type === 'Program') {
+    collectDeclaredNames(node, names);
+  }
+
+  _debugMode = true;
+  _debugLocals = names;
+
+  var code;
+  try {
+    code = 'var __r;\n' + emit(node);
+  } finally {
+    _debugMode = false;
+    _debugLocals = null;
+  }
+  return code;
+}
+
 exports.emit = emit;
+exports.emitDebug = emitDebug;

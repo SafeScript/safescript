@@ -121,9 +121,16 @@ function createSafeHandle(node, context) {
     prop = FORM_READ_PROPS[i];
     (function(p) {
       Object.defineProperty(handle, p, {
-        get: function() { return node[p]; },
+        get: function() {
+          if (context.journalRead) return context.journalRead(node, p);
+          return node[p];
+        },
         set: function(v) {
           context.ownership.checkMutation(node, 'set ' + p);
+          if (context.journalWrite) {
+            context.journalWrite(node, p, node[p], v, 'set ' + p);
+            return;
+          }
           node[p] = v;
         },
         enumerable: true, configurable: false
@@ -133,7 +140,10 @@ function createSafeHandle(node, context) {
 
   // ── textContent (read/write with size check) ────────────────────
   Object.defineProperty(handle, 'textContent', {
-    get: function() { return node.textContent; },
+    get: function() {
+      if (context.journalRead) return context.journalRead(node, 'textContent');
+      return node.textContent;
+    },
     set: function(v) {
       context.ownership.checkMutation(node, 'set textContent');
       var s = String(v);
@@ -141,6 +151,10 @@ function createSafeHandle(node, context) {
       var maxBytes = (limits && limits.maxTextBytes) || 262144;
       if (s.length > maxBytes) {
         throw new RangeError('SafeScript DOM: textContent exceeds limit (' + maxBytes + ' bytes)');
+      }
+      if (context.journalWrite) {
+        context.journalWrite(node, 'textContent', node.textContent, s, 'set textContent');
+        return;
       }
       node.textContent = s;
     },
@@ -150,7 +164,7 @@ function createSafeHandle(node, context) {
   // ── innerHTML (read returns text, write sanitizes) ──────────────
   Object.defineProperty(handle, 'innerHTML', {
     get: function() {
-      // Return raw innerHTML — the content was sanitized on write
+      if (context.journalRead) return context.journalRead(node, 'innerHTML');
       return node.innerHTML;
     },
     set: function(v) {
@@ -164,11 +178,13 @@ function createSafeHandle(node, context) {
       if (context.sanitizer) {
         s = context.sanitizer.sanitize(s, context.policy);
       }
+      if (context.journalWrite) {
+        context.journalWrite(node, 'innerHTML', node.innerHTML, s, 'set innerHTML');
+        return;
+      }
       node.innerHTML = s;
-      // Fix #15: count new children toward node budget
       var newCount = _countChildren(node);
       if (context.budgets) context.budgets.allocNodes(newCount);
-      // Mark new children as owned
       _markChildrenOwned(node, context);
     },
     enumerable: true, configurable: false
@@ -343,6 +359,8 @@ function createSafeHandle(node, context) {
 
   // getAttribute / setAttribute / removeAttribute / hasAttribute
   handle.getAttribute = function(name) {
+    var attrKey = 'attr:' + String(name).toLowerCase();
+    if (context.journalRead) return context.journalRead(node, attrKey);
     return node.getAttribute(String(name));
   };
 
@@ -359,6 +377,10 @@ function createSafeHandle(node, context) {
     // URL policy for src/href/action/formaction/poster
     if (_isURLAttribute(n)) {
       _checkURL(v, node.tagName.toLowerCase(), n, context);
+    }
+    if (context.journalWrite) {
+      context.journalWrite(node, 'attr:' + n, node.getAttribute(n), v, 'setAttribute');
+      return;
     }
     node.setAttribute(n, v);
     // Fix #7: auto-add rel=noopener noreferrer when setting target="_blank"
@@ -380,7 +402,12 @@ function createSafeHandle(node, context) {
 
   handle.removeAttribute = function(name) {
     context.ownership.checkMutation(node, 'removeAttribute');
-    node.removeAttribute(String(name));
+    var n = String(name).toLowerCase();
+    if (context.journalWrite) {
+      context.journalWrite(node, 'attr:' + n, node.getAttribute(n), null, 'removeAttribute');
+      return;
+    }
+    node.removeAttribute(n);
   };
 
   handle.hasAttribute = function(name) {
@@ -393,6 +420,15 @@ function createSafeHandle(node, context) {
     context.ownership.checkMutation(node, 'appendChild');
     var childNode = _unwrap(child);
     _checkNodeBudget(context);
+    // Log tree mutation as effect (still applies to real DOM — structural changes
+    // are applied immediately; property/attribute changes go through journal)
+    if (context._effectLog) {
+      context._effectLog.push({
+        kind: 'dom', op: 'appendChild',
+        node: node, child: childNode,
+        tagName: node.tagName || '', childTag: childNode.tagName || ''
+      });
+    }
     node.appendChild(childNode);
     context.ownership.markOwned(childNode);
     return wrap(childNode);
@@ -403,6 +439,13 @@ function createSafeHandle(node, context) {
     var newNode = _unwrap(newChild);
     var refNode = refChild ? _unwrap(refChild) : null;
     _checkNodeBudget(context);
+    if (context._effectLog) {
+      context._effectLog.push({
+        kind: 'dom', op: 'insertBefore',
+        node: node, child: newNode,
+        tagName: node.tagName || '', childTag: newNode.tagName || ''
+      });
+    }
     node.insertBefore(newNode, refNode);
     context.ownership.markOwned(newNode);
     return wrap(newNode);

@@ -1,8 +1,10 @@
 # SafeScript
 
-**JSON for code.** A safe computational subset of JavaScript.
+**JSON for code.** A safe computational subset of JavaScript — with built-in debugging, time travel, and edit-and-continue.
 
-JSON gave the world a safe way to exchange data. SafeScript does the same for computation. It's a strict subset of JavaScript — no `eval`, no `new`, no globals, no prototype access — that compiles to plain JS and PHP. Open a `.safe` file and you see code that's safe to run. The compiler is ~48 KB minified (~12 KB gzipped). Ship it anywhere, verify locally, no trust needed.
+JSON gave the world a safe way to exchange data. SafeScript does the same for computation. It's a strict subset of JavaScript — no `eval`, no globals, no prototype access — that compiles to plain JS and PHP. Open a `.safe` file and you see code that's safe to run. The compiler is ~48 KB minified (~12 KB gzipped). Ship it anywhere, verify locally, no trust needed.
+
+**v2.0** adds a transactional runtime: every mutation goes through a journal (write-ahead log with read overlay), so nothing changes until you commit. Debug mode instruments every statement with checkpoints — step through code, inspect locals, rewind to any point, edit the code while paused and continue with new logic. All of this runs inside the host application's own UI, with no browser DevTools required.
 
 ## Use Cases
 
@@ -28,6 +30,10 @@ const result = await SafeScript.run('return x + y;', { x: 10, y: 20 });
 await SafeScript.run('return Math.floor(3.7);');     // → 3
 await SafeScript.run('return JSON.parse("{}");');     // → {} (null-prototype, __proto__ stripped)
 await SafeScript.run('return Object.keys({a:1});');   // → ['a']
+
+// Constructors — safe built-in types are allowed
+await SafeScript.run('return new Date(2020, 0, 1);');     // → Date instance
+await SafeScript.run('var m = new Map(); m.set("a", 1); return m;');  // → Map
 
 // Math.random is deterministic by default (mulberry32 PRNG, seed 0)
 await SafeScript.run('return Math.random();');  // → same value every time
@@ -135,7 +141,7 @@ const result = await SafeScript.run(source, myScope);
 
 Four security barriers, defense in depth:
 
-1. **Token/grammar allowlist** — The parser accepts only a subset of JavaScript. No `eval`, `new`, `delete`, `class`, `import`, `async`, `await`, template literals, or access to `globalThis`/`window`/`document`. The AST is reconstructed from scratch — the original source text never appears in the output.
+1. **Token/grammar allowlist** — The parser accepts only a subset of JavaScript. No `eval`, `delete`, `class`, `import`, `async`, `await`, template literals, or access to `globalThis`/`window`/`document`. `new` is allowed but restricted to a constructor whitelist. The AST is reconstructed from scratch — the original source text never appears in the output.
 
 2. **Runtime property guards** — Bracket access (`obj[key]`) is rewritten to `__at(obj, key)` / `__set(obj, key, val)`, which block prototype-chain properties (`constructor`, `__proto__`, `prototype`, `caller`, `callee`) at runtime, even when keys are computed dynamically.
 
@@ -474,6 +480,8 @@ Options:
 - `seed: N` — PRNG seed. Default `0` (deterministic). Any integer for a custom seed. `null` for true `Math.random` (requires `env: { Random: true }`).
 - `env: { Random: true }` — approve environment capabilities. Currently only `Random` is defined.
 - `facades: { ... }` — per-method `this` facades. See [`this` and Facades](#this-and-facades).
+- `allowNew: [Ctor, ...]` — additional constructors allowed with `new` for this run (beyond built-in safe types and registered types).
+- `rawReturn: true` — disable return value sanitization (return functions and arbitrary objects).
 
 ### `SafeScript.compile(source)`
 
@@ -557,13 +565,404 @@ SafeScript supports a broad computational subset of ES2020:
 - Error handling: `try`/`catch`/`finally`, `throw`
 - Literals: strings, numbers (decimal, hex, binary, octal, BigInt), regex, arrays, objects
 
+### Constructors (`new`)
+
+`new` is allowed but restricted to a whitelist. This prevents arbitrary constructor calls while letting scripts use built-in data types naturally.
+
+**Always allowed** — `Map`, `Set`, `Date`, `RegExp`, `Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`:
+
+```js
+var m = new Map();
+m.set('key', 'value');
+
+var d = new Date(2024, 0, 1);
+var pattern = new RegExp('^test', 'i');
+```
+
+**Host-registered types** — anything registered with `SafeScript.lib()`:
+
+```js
+SafeScript.lib('Counter', Counter, { allowMethods: ['value', 'increment'] });
+// Now SafeScript code can use: new Counter(0)
+```
+
+**Per-run allowlist** — pass constructors in `opts.allowNew`:
+
+```js
+await SafeScript.run('return new Point(1, 2);', { Point: Point }, {
+  allowNew: [Point]
+});
+```
+
+Unregistered constructors throw at runtime: `SafeScript: constructor "Foo" is not allowed`.
+
 ## What's Blocked
 
 - **Identifiers**: `eval`, `Function`, `globalThis`, `window`, `document`, `require`, `process`, `Proxy`, `Reflect`, `Symbol`, `fetch`, `setTimeout`, and more
 - **Keywords**: `delete`, `class`, `import`, `export`, `with`, `debugger`, `yield`, `async`, `await`
-- **`new` on unregistered types**: `new` is allowed but restricted — only built-in safe types, registered types, and host-allowed constructors
 - **Properties** (bracket access): `constructor`, `__proto__`, `prototype`, `caller`, `callee`
 - **Syntax**: template literals, generators (`function*`)
+
+## Debugging (v2.0)
+
+SafeScript 2.0 adds a debugging system built entirely from its own instrumentation — no browser DevTools, no source maps, no `debugger` statements. The compiled output in debug mode inserts checkpoint calls (`__dbg`) after every statement. Each checkpoint can pause execution (via `await`), inspect locals, and hand off to a replacement function for edit-and-continue. See [RELEASE-NOTES.md](RELEASE-NOTES.md) for a summary of all v2.0 features and [Debugging.md](Debugging.md) for the complete debugging guide.
+
+### Quick Start — Debug Mode
+
+```js
+var session = SafeScript.debug('var x = 1;\nvar y = x + 1;\nreturn y;', {}, {
+  onPause: function(info) {
+    console.log('Paused at line', info.line, '— locals:', info.locals);
+  },
+  onFinish: function(value) {
+    console.log('Result:', value);
+  }
+});
+
+// Execution pauses at the first statement
+session.step();        // advance one statement
+session.step();        // advance again
+session.continue();    // run to completion (or next breakpoint)
+```
+
+### DebugSession API
+
+`SafeScript.debug(source, scope, opts)` returns a `DebugSession` with:
+
+- `step()` — advance one statement
+- `continue()` — run until next breakpoint or end
+- `stop()` — abort execution
+- `runToLine(line)` — run to a specific line (one-shot breakpoint)
+- `toggleBreakpoint(line)` / `setBreakpoints(lines)` — manage breakpoints
+- `getLocals()` — current local variables (when paused)
+- `getHistory()` — all step records (line numbers, effects)
+- `editAndContinue(newSource)` — recompile and resume with current locals
+- `rewindTo(stepIndex)` — time travel to a previous step
+- `commit()` — apply all journal writes to real objects (auto-snapshots DOM first)
+- `discard()` — clear the journal, real state unchanged
+- `stepOver()` — advance to next statement at same or lower call depth (skip function bodies)
+- `stepOut()` — run until returning to the caller's level
+- `evaluate(expr)` — evaluate a SafeScript expression in the current paused scope
+- `setConditionalBreakpoint(line, condition?)` — break only when condition is truthy
+- `fork()` — clone the session into an independent copy for parallel exploration
+- `serialize()` — export session state as a JSON-safe object
+- `DebugSession.deserialize(data, resolver?)` — restore a session from serialized data
+- `snapshotDOM()` — capture container innerHTML
+- `restoreDOM(index)` — restore a previous snapshot
+- `findSnapshotBefore(stepIndex)` — nearest snapshot at or before a step
+- `queryNodeHistory(node, prop?)` — journal entries for a DOM node (newest first)
+- `queryNodeSteps(node, prop?)` — step indices where a node was modified
+- `getNodeTimeline(node)` — change history for an element (oldest first)
+- `state` — `'running'`, `'paused'`, `'finished'`, or `'stopped'`
+- `currentLine` — line number where execution is paused
+- `currentLocals` — snapshot of local variables at the pause point
+
+Callbacks: `onPause(info)`, `onStep(step)`, `onFinish(value)`, `onError(err)`, `onCommit(result)`.
+
+### Journal — Transactional Execution
+
+In debug mode, all side effects go through a **journal** (write-ahead log with read overlay). Property writes on scope objects are recorded in the journal instead of mutating the real objects. Reads check the journal overlay first, then fall through to the real value.
+
+```js
+var data = { count: 0 };
+var session = SafeScript.debug('count = count + 1; count = count + 1;', { count: data.count }, {
+  captureAllLocals: true,
+  onPause: function() {}
+});
+
+session.step();
+session.step();
+// data.count is still 0 — nothing mutated yet
+
+session.commit();
+// Now data.count reflects the changes
+
+// Or: session.discard() to throw away all changes
+```
+
+The journal also tracks DOM mutations when using the DOM membrane in debug mode. Attribute writes, style changes, and text content updates all go through the journal overlay. This means you can step through DOM-manipulating code and see what would change, without actually changing the page — then commit to apply, or discard to leave the DOM untouched.
+
+### Time Travel
+
+Every step is recorded in history with its line number, locals snapshot, and side effects. `rewindTo(stepIndex)` rolls the journal cursor back and restores the locals from that point.
+
+```js
+session.step();  // step 0: x = 1
+session.step();  // step 1: y = x + 1
+
+// Go back to step 0
+session.rewindTo(0);
+// Now paused at step 0 with the locals from that point
+// Journal writes after step 0 are rolled back
+```
+
+Use `captureAllLocals: true` to capture locals at every step (not just pause points) for full time-travel support.
+
+### Edit-and-Continue
+
+While paused, you can edit the source code and resume with the new logic. The system recompiles the entire source in debug mode and creates a replacement function that receives the current locals — new variables in the edited code work naturally.
+
+```js
+session.step();  // paused after "var x = 1;"
+
+// Edit the remaining code
+session.editAndContinue('var x = 1;\nvar y = x * 10;\nreturn y;');
+session.continue();
+// Execution continues with the new logic, using current locals
+```
+
+### Debug Protocol — Pluggable Transport
+
+The debug protocol is a bidirectional messaging interface between the engine (DebugSession) and a driver (IDE/UI). It's transport-agnostic — works over postMessage, MessagePort, WebSocket, or in-process function calls.
+
+```js
+// In-process driver (same thread)
+var driver = new SafeScript.InProcessDriver(function(event) {
+  console.log('Event:', event.type, event.data);
+});
+
+var session = SafeScript.debug(source, scope, {
+  driver: driver,
+  onPause: function() {},
+  onFinish: function() {}
+});
+
+// Send commands from the UI
+driver.command('step');
+driver.command('setBreakpoints', { lines: [5, 10] });
+driver.command('editAndContinue', { source: newSource });
+driver.command('rewindTo', { stepIndex: 3 });
+driver.command('commit');
+```
+
+**Built-in transports:**
+
+| Transport | Use case |
+|-----------|----------|
+| `InProcessDriver` | Same-thread debugging (simplest) |
+| `PostMessageDriver` | Web Worker or iframe — debug session runs off the main thread |
+| `PortDriver` | MessagePort (SharedWorker, BroadcastChannel) |
+
+**25 commands** (driver → engine): `step`, `continue`, `stop`, `stepOver`, `stepOut`, `setBreakpoints`, `toggleBreakpoint`, `runToLine`, `setConditionalBreakpoint`, `editAndContinue`, `evaluate`, `rewindTo`, `commit`, `discard`, `getLocals`, `getHistory`, `getJournal`, `getNodeTimeline`, `getDOMSnapshots`, `snapshotDOM`, `restoreDOM`, `fork`, `serialize`, `setLogpoint`, `removeLogpoint`.
+
+**18 events** (engine → driver): `paused`, `stepped`, `finished`, `error`, `committed`, `discarded`, `rewound`, `locals`, `history`, `journal`, `nodeTimeline`, `domSnapshots`, `domSnapshot`, `domRestored`, `evaluated`, `forked`, `serialized`, `logpoint`.
+
+Third-party transports (SafeStudio, xdebug-style debuggers) implement the same interface. A driver is any object with a `send(event)` method and an `onMessage(callback)` method.
+
+### Web Worker Transport
+
+Run the debug session in a Web Worker to keep the main thread responsive:
+
+```js
+// Main thread
+var worker = new Worker('my-worker.js');
+var proxy = SafeScript.createWorkerProxy(worker, {
+  channel: 'my-session',
+  onEvent: function(event) {
+    if (event.type === 'paused') {
+      console.log('Paused at line', event.data.line);
+    }
+  }
+});
+
+proxy.step();
+proxy.setBreakpoints([5, 10]);
+proxy.editAndContinue(newSource);
+proxy.commit();
+
+// Worker (my-worker.js)
+importScripts('safescript.min.js');
+SafeScript.runInWorker(self, source, scope, { channel: 'my-session' });
+```
+
+The `DebugProxy` mirrors the full `DebugSession` API. State (`state`, `currentLine`, `currentLocals`) is updated from incoming events.
+
+### DOM Facades + Journal
+
+When using SafeScript's DOM membrane (`opts.dom`) in debug mode, DOM mutations automatically route through the journal:
+
+- **Attribute writes** (`setAttribute`, `removeAttribute`) → journal key `attr:<name>`
+- **Text content** (`textContent`, `innerHTML`) → journal key by property name
+- **Style changes** (property set, `setProperty`, `cssText`) → journal key `style:<prop>`
+- **Tree mutations** (`appendChild`, `insertBefore`) → logged as side effects (structural changes apply immediately)
+
+Reads check the journal overlay first, so `getAttribute('class')` returns the journaled value if one was written. On commit, all writes are applied to the real DOM. On discard, the DOM is untouched.
+
+This means you can step through DOM-manipulating SafeScript code and see a virtual view of the page that can be rewound, forked, and replayed — without touching the real DOM until you're ready.
+
+### DOM Snapshots
+
+The debug session captures `innerHTML` snapshots of the container at each commit point. This gives structural undo for free — tree mutations (appendChild, insertBefore) that can't be reversed property-by-property are handled by restoring the snapshot.
+
+```js
+// Snapshots are taken automatically before each commit()
+session.commit();  // auto-snapshots, then applies journal writes to real DOM
+
+// Manual snapshots at any point
+session.snapshotDOM();
+
+// Restore a previous state
+session.restoreDOM(0);  // restore to first snapshot
+
+// Find the nearest snapshot before a given step
+var idx = session.findSnapshotBefore(stepIndex);
+session.restoreDOM(idx);
+```
+
+### Reverse Lookup: Element → Operations
+
+Given any DOM element in the container, you can look up every operation that changed it, and jump to the exact moment in the code where each change happened.
+
+```js
+// "What happened to this element?" — full timeline, oldest first
+var timeline = session.getNodeTimeline(element);
+// → [{ step: 0, line: 5, prop: 'textContent', was: '', to: 'Hello' },
+//    { step: 3, line: 12, prop: 'attr:class', was: null, to: 'active' },
+//    { step: 7, line: 18, prop: 'style:color', was: '', to: 'red' }]
+
+// "Which moments can I jump to for this element?"
+var steps = session.queryNodeSteps(element);
+// → [7, 3, 0]  (newest first — these are rewindTo targets)
+
+// "Show me only the style changes"
+var styleSteps = session.queryNodeSteps(element, 'style:color');
+// → [7]
+
+// Jump to the moment the class was set
+session.rewindTo(3);
+// Now paused at step 3, journal rolled back, locals restored
+
+// All journal entries for this node (newest first)
+var entries = session.queryNodeHistory(element);
+```
+
+This is bidirectional: you can go from code → visual (step through and watch the DOM change) or from visual → code (click an element, see what changed it, jump to that line). SafeStudio can render a "changes to this element" panel where each entry is a clickable jump point.
+
+### Watch Expressions
+
+Evaluate any SafeScript expression in the current paused scope:
+
+```js
+session.evaluate('x + y');           // → 30
+session.evaluate('obj.nested.val');  // → 'hello'
+session.evaluate('arr.length > 5');  // → true
+```
+
+The expression is compiled through SafeScript (same safety guarantees) and evaluated against the current locals. The session state is not modified.
+
+### Conditional Breakpoints
+
+Break only when a condition is truthy:
+
+```js
+session.setConditionalBreakpoint(10, 'i === 50');  // pause at line 10 only when i is 50
+session.setConditionalBreakpoint(15);               // unconditional (same as toggleBreakpoint)
+session.setConditionalBreakpoint(10, 'arr.length > 100');  // replace condition
+```
+
+### Step Over / Step Out
+
+```js
+session.step();      // step into — advances one statement, enters function bodies
+session.stepOver();  // step over — advances one statement, skips function bodies
+session.stepOut();   // step out — runs until returning to the caller's level
+```
+
+### Fork
+
+Clone the debug session to explore a different code path without losing the current state:
+
+```js
+var child = session.fork();
+// child is an independent copy — same breakpoints, history, locals, journal
+// Modify child without affecting the parent
+child.step();  // child advances, parent stays put
+```
+
+### Serialize / Deserialize
+
+Persist a debug session (e.g. to a Qbix Stream) and restore it later:
+
+```js
+var data = session.serialize();       // JSON-safe object
+var json = JSON.stringify(data);      // send over the wire, store in a stream
+
+var restored = DebugSession.deserialize(JSON.parse(json), function(objectId) {
+  return originalObjects[objectId];   // resolve journal target references
+});
+```
+
+### Logpoints
+
+Logpoints fire a message when a line is reached, without pausing execution — like `console.log` but controlled from the driver and removable at runtime. Template strings support `{expr}` interpolation against the current locals:
+
+```js
+session.setLogpoint(5, 'x = {x}, y = {y}');   // log at line 5
+session.setLogpoint(12, 'entering loop');       // plain message
+
+session.onLog = function(info) {
+  console.log('[line ' + info.line + '] ' + info.message);
+};
+
+session.removeLogpoint(5);  // stop logging at line 5
+```
+
+Via the protocol: `setLogpoint` / `removeLogpoint` commands, `logpoint` event. Logpoints are preserved across `fork()` and `serialize()` / `deserialize()`.
+
+### Real-World Example: DOM Container
+
+A complete example of loading SafeScript, scoping it to a DOM container, and running it — safely, with no ability to touch anything outside the container:
+
+```html
+<div id="my-widget">
+  <h2>Widget Title</h2>
+  <p class="content">Loading...</p>
+</div>
+
+<script src="safescript.min.js"></script>
+<script>
+var safeSource = [
+  '/**',
+  ' * @safescript 0.2',
+  ' * @needs container: Element',
+  ' */',
+  'var p = container.querySelector(".content");',
+  'p.textContent = "Hello from SafeScript!";',
+  'p.style.color = "green";',
+  'return { status: "ok" };'
+].join('\n');
+
+SafeScript.run(safeSource, {}, {
+  dom: {
+    root: document.getElementById('my-widget'),
+    policy: {
+      tags: ['div', 'p', 'span', 'h1', 'h2', 'h3', 'a', 'img'],
+      attrs: ['class', 'id', 'href', 'src', 'alt', 'data-*'],
+      styles: null  // all safe CSS properties allowed
+    }
+  }
+}).then(function(result) {
+  console.log('Widget initialized:', result);
+});
+</script>
+```
+
+The DOM membrane ensures scripts can only see and modify elements inside `root`. In debug mode, all mutations go through the journal instead of the real DOM.
+
+For additional isolation on a [Qbix](https://github.com/Qbix/Q.js)-powered site, `Q.Safebox` provides iframe sandboxing with `Q.Proxy` for transparent cross-context proxying. But Q.Safebox is optional — SafeScript's security comes from static analysis and compile-time instrumentation, not from a runtime sandbox.
+
+## Security Without a Sandbox
+
+SafeScript code is safe to run on the main thread without a Web Worker, iframe, or any browser sandbox. The four security barriers (token allowlist, runtime guards, global shadowing, execution guards) plus the constructor whitelist and return sanitization mean SafeScript code cannot:
+
+- Access any global or prototype chain
+- Call `eval`, `Function`, or any blocked identifier
+- Construct arbitrary types
+- Return functions (capabilities are stripped)
+- Read or write DOM outside its container
+- Run forever (operation limit + timeout)
+
+The only resource a SafeScript can exhaust is memory — by building large data structures within the operation limit. For most use cases this is bounded by the operation counter. For untrusted code from the internet, running in a Web Worker via the built-in transport adds memory isolation without code changes to the `.safe` file.
 
 ## Specification
 
@@ -594,13 +993,17 @@ Integration packages for common environments:
 ## Tests
 
 ```bash
-node test.js               # v0.1 linter/wrapper
-node test-compiler.js      # compiler pipeline
-node test-battle.js        # adversarial/escape attempts
-node test-header.js        # header parser + load() + run(bundle)
-node test-guards-hooks.js  # execution guards + hooks system
-node test-type-registry.js # type registry — method whitelisting
-node test-type-header.js   # @type header declarations + load() validation
+node test.js                # core compiler + runtime (153 tests)
+node test-v1.4.js           # v1.4: new keyword, constructors, return sanitization (30 tests)
+node test-debug.js          # v2.0: debug instrumentation, stepping, breakpoints (24 tests)
+node test-journal.js        # v2.0: journal, time travel, commit/discard (23 tests)
+node test-edit-continue.js  # v2.0: edit-and-continue, debug protocol (14 tests)
+node test-dom-journal.js    # v2.0: DOM journal integration (15 tests)
+node test-dom-snapshots.js  # v2.0: DOM snapshots, reverse lookup, element timeline (21 tests)
+node test-advanced-debug.js # v2.0: evaluate, conditional breakpoints, stepOver/Out, fork, serialize (24 tests)
+node test-dom.js            # DOM membrane security tests
+node test-type-registry.js  # type registry — method whitelisting
+node test-type-header.js    # @type header declarations + load() validation
 ```
 
 ## License

@@ -100,9 +100,11 @@ function validateCSSText(cssText) {
  *
  * @param {CSSStyleDeclaration} nativeStyle - The real style object
  * @param {Object} policy - Host policy (for potential style property allowlist)
+ * @param {Element} node - The native DOM node (for journal keying)
+ * @param {Object} context - The DOM context (may have journal hooks)
  * @returns {Object} Frozen safe style facade
  */
-function createSafeStyle(nativeStyle, policy) {
+function createSafeStyle(nativeStyle, policy, node, context) {
   var facade = Object.create(null);
 
   // Allowlist of style properties (null = allow all safe CSS properties)
@@ -123,14 +125,22 @@ function createSafeStyle(nativeStyle, policy) {
   // Define get/set for each known CSS property
   for (var i = 0; i < CSS_PROPERTIES.length; i++) {
     (function(prop) {
+      var jKey = 'style:' + prop;
       Object.defineProperty(facade, prop, {
         get: function() {
+          if (context && context.journalRead && node) {
+            return context.journalRead(node, jKey);
+          }
           return nativeStyle[prop];
         },
         set: function(value) {
           checkPropAllowed(prop);
           validateCSSValue(prop, value);
-          nativeStyle[prop] = value;
+          if (context && context.journalWrite && node) {
+            context.journalWrite(node, jKey, nativeStyle[prop], value, 'style-set');
+          } else {
+            nativeStyle[prop] = value;
+          }
         },
         enumerable: true,
         configurable: false
@@ -141,11 +151,18 @@ function createSafeStyle(nativeStyle, policy) {
   // cssText — full style text access
   Object.defineProperty(facade, 'cssText', {
     get: function() {
+      if (context && context.journalRead && node) {
+        return context.journalRead(node, 'style:cssText');
+      }
       return nativeStyle.cssText;
     },
     set: function(value) {
       validateCSSText(value);
-      nativeStyle.cssText = value;
+      if (context && context.journalWrite && node) {
+        context.journalWrite(node, 'style:cssText', nativeStyle.cssText, value, 'style-set');
+      } else {
+        nativeStyle.cssText = value;
+      }
     },
     enumerable: true,
     configurable: false
@@ -159,20 +176,30 @@ function createSafeStyle(nativeStyle, policy) {
 
   // Method-level access
   facade.getPropertyValue = function(prop) {
-    // Fix #12: check allowlist on read too
     checkPropAllowed(prop);
+    if (context && context.journalRead && node) {
+      return context.journalRead(node, 'style:' + prop);
+    }
     return nativeStyle.getPropertyValue(prop);
   };
 
   facade.setProperty = function(prop, value, priority) {
     checkPropAllowed(prop);
     validateCSSValue(prop, value);
-    nativeStyle.setProperty(prop, value, priority || '');
+    if (context && context.journalWrite && node) {
+      context.journalWrite(node, 'style:' + prop, nativeStyle.getPropertyValue(prop), value, 'style-setProperty');
+    } else {
+      nativeStyle.setProperty(prop, value, priority || '');
+    }
   };
 
   facade.removeProperty = function(prop) {
     checkPropAllowed(prop);
-    return nativeStyle.removeProperty(prop);
+    if (context && context.journalWrite && node) {
+      context.journalWrite(node, 'style:' + prop, nativeStyle.getPropertyValue(prop), '', 'style-removeProperty');
+    } else {
+      return nativeStyle.removeProperty(prop);
+    }
   };
 
   facade.getPropertyPriority = function(prop) {
@@ -197,5 +224,5 @@ exports.DANGEROUS_CSS_RE = DANGEROUS_CSS_RE;
  * Adapter for SafeHandle lazy sub-facade creation.
  */
 exports.create = function(node, context) {
-  return createSafeStyle(node.style, context.policy);
+  return createSafeStyle(node.style, context.policy, node, context);
 };

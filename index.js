@@ -23,6 +23,9 @@ var validator = require('./src/validate');
 var compiler = require('./src/compile');
 var runtime = require('./src/runtime');
 var header = require('./src/header');
+var debugModule = require('./src/debug');
+var journalModule = require('./src/journal');
+var protocolModule = require('./src/debug-protocol');
 
 // Library registry — hosts register named libraries via SafeScript.lib()
 var _libs = Object.create(null);
@@ -272,6 +275,122 @@ var SafeScript = {
       delete _typeNames[names[i]];
     }
   },
+
+  /**
+   * v2.0: Start a debug session.
+   *
+   * Compiles the source in debug mode (with __dbg checkpoints after every
+   * statement), creates a DebugSession, and begins execution. The execution
+   * pauses at breakpoints and can be controlled via the returned session.
+   *
+   * @param {string} source - SafeScript source code
+   * @param {Object} scope - Capabilities to inject
+   * @param {Object} [opts] - Debug options
+   * @param {Function} [opts.onPause] - Called when paused at a breakpoint
+   * @param {Function} [opts.onStep] - Called after each statement
+   * @param {Function} [opts.onFinish] - Called when execution completes
+   * @param {Function} [opts.onError] - Called on runtime error
+   * @param {Array<number>} [opts.breakpoints] - Initial breakpoint lines
+   * @param {boolean} [opts.captureAllLocals] - Capture locals at every step
+   * @param {number} [opts.timeout] - Execution timeout in ms
+   * @param {number} [opts.maxOps] - Max operations
+   * @returns {DebugSession}
+   */
+  debug: function(source, scope, opts) {
+    opts = opts || {};
+
+    // Create the debug session
+    var session = new debugModule.DebugSession({
+      onPause: opts.onPause,
+      onStep: opts.onStep,
+      onFinish: opts.onFinish,
+      onError: opts.onError,
+      onCommit: opts.onCommit,
+      onLog: opts.onLog,
+      breakpoints: opts.breakpoints,
+      captureAllLocals: opts.captureAllLocals
+    });
+
+    // Parse header
+    var parsedHeader = header.parseHeader(source);
+
+    // Compile in debug mode
+    var compiled = compiler.compile(source, { debug: true });
+
+    // Build the runtime function with debug session attached
+    var runOpts = {
+      timeout: opts.timeout || 0,
+      maxOps: opts.maxOps,
+      header: parsedHeader,
+      debugSession: session,
+      rawReturn: true, // debug mode returns raw values
+      dom: opts.dom,
+      allowNew: opts.allowNew
+    };
+    var fn = runtime.buildFunction(compiled.code, scope, runOpts);
+
+    // Store compile function for evaluate()
+    session._compileFn = function(src) { return compiler.compile(src); };
+
+    // Attach a debug protocol driver if provided
+    var protocol = null;
+    if (opts.driver) {
+      protocol = new protocolModule.DebugProtocol(session, opts.driver);
+      protocol.setCompileTail(require('./src/compile').compileTail);
+      session.protocol = protocol;
+    }
+
+    // Start execution (non-blocking — pauses at first __dbg checkpoint)
+    var promise = fn();
+    promise.then(
+      function(v) {
+        session.state = 'finished';
+        session.onFinish(v);
+      },
+      function(e) {
+        if (e.message !== 'SafeScript: debug session stopped') {
+          session.state = 'finished';
+          session.onError(e);
+        }
+      }
+    );
+
+    return session;
+  },
+
+  /**
+   * v2.0: DebugSession class (exported for advanced use).
+   */
+  DebugSession: debugModule.DebugSession,
+
+  /**
+   * v2.0: Journal class (exported for advanced use).
+   */
+  Journal: journalModule.Journal,
+
+  /**
+   * v2.0: Debug protocol — pluggable transport for driving debug sessions.
+   */
+  DebugProtocol: protocolModule.DebugProtocol,
+  InProcessDriver: protocolModule.InProcessDriver,
+  PostMessageDriver: protocolModule.PostMessageDriver,
+  PortDriver: protocolModule.PortDriver,
+  DEBUG_COMMANDS: protocolModule.COMMANDS,
+  DEBUG_EVENTS: protocolModule.EVENTS,
+
+  /**
+   * v2.0: compileTail for edit-and-continue.
+   */
+  compileTail: require('./src/compile').compileTail,
+
+  /**
+   * v2.0: Web Worker transport.
+   * createWorkerProxy(worker, opts) — main-thread proxy for worker debug session.
+   * runInWorker(self, source, scope, opts) — run debug session inside a Worker.
+   */
+  createWorkerProxy: require('./src/worker').createWorkerProxy,
+  runInWorker: require('./src/worker').runInWorker,
+  DebugProxy: require('./src/worker').DebugProxy,
 
   /**
    * v0.1 compatibility: wrap mode (linter + global shadowing).

@@ -20,6 +20,7 @@ var createEventBridge  = require('./event-bridge').createEventBridge;
 var createSafeWindow   = require('./safe-window').createSafeWindow;
 var createSafeJQuery   = require('./safe-jquery').createSafeJQuery;
 var createSafeQ        = require('./safe-q').createSafeQ;
+var attachDOMJournal   = require('./dom-journal').attachDOMJournal;
 
 /**
  * Default tag allowlist — safe subset of HTML.
@@ -143,7 +144,7 @@ function mergePolicy(hostPolicy) {
  * @param {Object}  [policy] - Host-supplied policy overrides
  * @returns {Object} context with .scope (to inject into SafeScript), .cleanup()
  */
-function createDOMContext(root, policy) {
+function createDOMContext(root, policy, debugSession) {
   var merged = mergePolicy(policy);
 
   // ── Core modules ──────────────────────────────────────────────
@@ -195,6 +196,12 @@ function createDOMContext(root, policy) {
   var initialNodes = budgets.countSubtreeNodes(root);
   budgets.setNodeCount(initialNodes);
 
+  // ── Debug journal: intercept DOM mutations ────────────────────
+  var domJournalAdapter = null;
+  if (debugSession && debugSession.journal) {
+    domJournalAdapter = attachDOMJournal(context, debugSession.journal, debugSession._effectLog);
+  }
+
   // ── Scope additions for SafeScript ────────────────────────────
   var scope = {
     document:      safeDoc,
@@ -225,6 +232,7 @@ function createDOMContext(root, policy) {
       if (context.eventBridge && context.eventBridge.cleanup) {
         context.eventBridge.cleanup();
       }
+      if (domJournalAdapter) domJournalAdapter.detach();
       cache.clear();
       ownership.clear();
     }

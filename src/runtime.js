@@ -710,7 +710,11 @@ function buildFunction(source, scope, opts) {
     if (!createDOMContext) {
       throw new Error('SafeScript: DOM membrane is not available in this environment. Provide DOM access via scope instead.');
     }
-    domContext = createDOMContext(opts.dom.root, opts.dom.policy);
+    domContext = createDOMContext(opts.dom.root, opts.dom.policy, debugSession);
+    // Tell debug session about the DOM root for snapshots
+    if (debugSession) {
+      debugSession.setDOMRoot(opts.dom.root);
+    }
     // Inject DOM globals into scope
     var domScope = domContext.scope;
     var domKeys = Object.keys(domScope);
@@ -760,8 +764,35 @@ function buildFunction(source, scope, opts) {
   // Host-allowed constructors for `new` (from opts.allowNew)
   var allowNew = opts.allowNew || null;
 
-  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, then scope keys
-  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals'].concat(scopeKeys);
+  // Debug mode: accept __dbg checkpoint function
+  var debugSession = opts.debugSession || null;
+
+  // In debug mode, build a reverse map: sanitized value → original value
+  // so the journal can record writes against the original objects
+  var _debugOriginals = null;
+  if (debugSession && scope) {
+    _debugOriginals = new Map();
+    var origKeys = Object.keys(scope);
+    for (var oi = 0; oi < origKeys.length; oi++) {
+      var origVal = scope[origKeys[oi]];
+      var sanVal = scopeObj[origKeys[oi]];
+      if (origVal && typeof origVal === 'object' && sanVal && typeof sanVal === 'object') {
+        _debugOriginals.set(sanVal, origVal);
+        // Also map nested objects one level deep
+        var nestedKeys = Object.keys(origVal);
+        for (var ni = 0; ni < nestedKeys.length; ni++) {
+          var nOrig = origVal[nestedKeys[ni]];
+          var nSan = sanVal[nestedKeys[ni]];
+          if (nOrig && typeof nOrig === 'object' && nSan && typeof nSan === 'object') {
+            _debugOriginals.set(nSan, nOrig);
+          }
+        }
+      }
+    }
+  }
+
+  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, __dbg, then scope keys
+  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals', '__dbg'].concat(scopeKeys);
 
   // Always use AsyncFunction constructor (auto-async model)
   var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
@@ -809,8 +840,96 @@ function buildFunction(source, scope, opts) {
     // Set per-execution allowNew list
     _allowNewCtors = allowNew;
 
+    // Create __dbg checkpoint function (no-op if not debugging)
+    var __dbg;
+    // In debug mode, wrap __at/__set/__call to route through journal
+    var effectiveAt = __at;
+    var effectiveSet = __set;
+    var effectiveCall = __call;
+    var effectiveCallOpt = __call_opt;
+
+    if (debugSession) {
+      __dbg = debugSession.createCheckpoint();
+      var journal = debugSession.journal;
+
+      // Journal-aware __at: reads from overlay first
+      effectiveAt = function(obj, key) {
+        if (obj == null) {
+          throw new TypeError('Cannot read property "' + key + '" of ' + String(obj));
+        }
+        var k = String(key);
+        if (defs.BLOCKED_PROPS[k]) return undefined;
+        // Check journal overlay first
+        if (journal.has(obj, k)) {
+          return journal.read(obj, k);
+        }
+        return obj[k];
+      };
+
+      // Journal-aware __set: writes to journal, not real object
+      effectiveSet = function(obj, key, val) {
+        if (obj == null) {
+          throw new TypeError('Cannot set property "' + key + '" of ' + String(obj));
+        }
+        var k = String(key);
+        if (defs.BLOCKED_PROPS[k]) {
+          throw new TypeError('SafeScript: cannot set blocked property "' + k + '"');
+        }
+        // Resolve to original object for journal tracking
+        var origObj = (_debugOriginals && _debugOriginals.has(obj)) ? _debugOriginals.get(obj) : obj;
+        // Read old value (from journal overlay or real object)
+        var oldVal = journal.has(origObj, k) ? journal.read(origObj, k) : origObj[k];
+        // Write to journal against the ORIGINAL object
+        journal.write(origObj, k, oldVal, val);
+        // Also update the sanitized copy so subsequent reads within the
+        // compiled code see the new value (without needing __at for dot access)
+        obj[k] = val;
+        // Log side effect
+        debugSession._effectLog.push({
+          kind: 'write', target: origObj, key: k, was: oldVal, to: val
+        });
+        return val;
+      };
+
+      // Journal-aware __call: logs the call as a side effect
+      effectiveCall = function(obj, method) {
+        // Log the call
+        var callArgs = [];
+        for (var ci = 2; ci < arguments.length; ci++) {
+          callArgs.push(arguments[ci]);
+        }
+        debugSession._effectLog.push({
+          kind: 'call', target: obj, method: method, args: callArgs
+        });
+        // Delegate to the real __call
+        return __call.apply(undefined, arguments);
+      };
+
+      effectiveCallOpt = function(obj, method) {
+        if (obj == null) return undefined;
+        var callArgs = [];
+        for (var ci = 2; ci < arguments.length; ci++) {
+          callArgs.push(arguments[ci]);
+        }
+        debugSession._effectLog.push({
+          kind: 'call', target: obj, method: method, args: callArgs, optional: true
+        });
+        return __call_opt.apply(undefined, arguments);
+      };
+    } else {
+      __dbg = async function() { return null; };
+    }
+
     // Bind the arguments
-    var args = [scopeObj, __at, __set, __call, __call_opt, __new, __check, thisCell, invocationGlobals];
+    var args = [scopeObj, effectiveAt, effectiveSet, effectiveCall, effectiveCallOpt, __new, __check, thisCell, invocationGlobals, __dbg];
+
+    // Store runtime args on the debug session for edit-and-continue
+    // (compileTail needs these to build the replacement function)
+    if (debugSession) {
+      debugSession._runtimeArgs = args.slice(0); // copy
+      debugSession._compileTailFn = require('./compile').compileTail;
+    }
+
     for (var i = 0; i < scopeKeys.length; i++) {
       args.push(scopeObj[scopeKeys[i]]);
     }
