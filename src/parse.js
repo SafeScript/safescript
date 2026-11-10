@@ -949,6 +949,34 @@ Parser.prototype._parseUnary = function() {
     this.pos++;
     return { type: 'AwaitExpression', argument: this._parseUnary() };
   }
+  // new Constructor(args)
+  if (t.type === TT.Keyword && t.value === 'new') {
+    this.pos++;
+    var callee = this._parsePrimary();
+    // Allow member access for new a.B.C(...)
+    while (this._at(TT.Punct, '.')) {
+      this.pos++;
+      var prop = this._eat(TT.Ident);
+      callee = { type: 'MemberExpression', object: callee,
+                 property: { type: 'Identifier', name: prop.value },
+                 computed: false, optional: false };
+    }
+    var args = [];
+    if (this._at(TT.Punct, '(')) {
+      this._eat(TT.Punct, '(');
+      while (!this._at(TT.Punct, ')') && !this._at(TT.EOF)) {
+        if (this._at(TT.Punct, '...')) {
+          this.pos++;
+          args.push({ type: 'SpreadElement', argument: this._parseAssignment() });
+        } else {
+          args.push(this._parseAssignment());
+        }
+        if (!this._at(TT.Punct, ')')) this._eat(TT.Punct, ',');
+      }
+      this._eat(TT.Punct, ')');
+    }
+    return { type: 'NewExpression', callee: callee, arguments: args };
+  }
   // Prefix ++/--
   if (t.type === TT.Punct && (t.value === '++' || t.value === '--')) {
     this.pos++;

@@ -149,29 +149,32 @@ With an empty scope, SafeScript is pure computation with safe globals — determ
 
 A `.safe` file is a function body. The compiler wraps it in a function, the host calls that function with a scope, and the code uses `return` to hand a value back. `run()` always returns a Promise.
 
+Return values are sanitized to **POD** (plain old data): primitives, plain objects, arrays, and instances of safe built-in types (`Date`, `Map`, `Set`, `RegExp`, `Error` family) and registered types pass through. Functions are stripped — a SafeScript returns data, not behavior.
+
 ```js
 // Return a computed value
 await SafeScript.run('return price * qty;', { price: 9.99, qty: 3 });  // → 29.97
 
-// Return a function (the function itself is async)
-var double = await SafeScript.run('return function(n) { return n * 2; };', {});
-await double(21);  // → 42
+// Return a data structure
+await SafeScript.run('return { name: "test", items: [1, 2, 3] };', {});
+// → { name: "test", items: [1, 2, 3] }
 
-// Return an object — the "module" pattern
-var mod = await SafeScript.run(`
-  var count = 0;
-  return {
-    inc: function() { count = count + 1; return count; },
-    get: function() { return count; }
-  };
-`, {});
-await mod.inc(); await mod.inc(); await mod.get(); // → 2
+// Functions in returned objects are stripped
+await SafeScript.run('return { val: 42, fn: function() {} };', {});
+// → { val: 42 }  (fn is stripped)
+
+// Return built-in instances
+await SafeScript.run('return new Date(2020, 0, 1);', {});  // → Date instance
+await SafeScript.run('var m = new Map(); m.set("k", 1); return m;', {});  // → Map instance
 
 // Side-effect only (write to an injected capability, no return needed)
 await SafeScript.run('db.store(record);', { db: myDb, record: data });
+
+// Q.Tool.define pattern — behavior is registered as a side effect
+await SafeScript.run('Q.Tool.define("my-tool", { init: function() { ... } });', { Q: Q });
 ```
 
-There is no `export`, no `module.exports`, and no implicit last-expression return. `return` makes intent explicit and keeps `.safe` files readable.
+There is no `export`, no `module.exports`, and no implicit last-expression return. `return` makes intent explicit and keeps `.safe` files readable. Use `opts.rawReturn: true` to disable sanitization for internal/trusted use.
 
 ### Auto-Async
 
@@ -547,6 +550,7 @@ SafeScript supports a broad computational subset of ES2020:
 - Variables: `var`, `let`, `const`
 - Control flow: `if`/`else`, `for`, `for-in`, `for-of`, `while`, `do-while`, `switch`/`case`, `break`, `continue`, `return`, labeled statements
 - Functions: declarations, expressions, arrows, default params, rest params, `this` (via facades)
+- Constructors: `new` with built-in types (`Map`, `Set`, `Date`, `RegExp`, `Error` family), registered types, and host-allowed constructors
 - Expressions: all arithmetic, comparison, logical, ternary, `typeof`, `void`, `instanceof`, nullish coalescing (`??`), optional chaining (`?.`)
 - Destructuring: array and object patterns, rest elements, nested
 - Spread: arrays and objects
@@ -556,7 +560,8 @@ SafeScript supports a broad computational subset of ES2020:
 ## What's Blocked
 
 - **Identifiers**: `eval`, `Function`, `globalThis`, `window`, `document`, `require`, `process`, `Proxy`, `Reflect`, `Symbol`, `fetch`, `setTimeout`, and more
-- **Keywords**: `new`, `delete`, `class`, `import`, `export`, `with`, `debugger`, `yield`, `async`, `await`
+- **Keywords**: `delete`, `class`, `import`, `export`, `with`, `debugger`, `yield`, `async`, `await`
+- **`new` on unregistered types**: `new` is allowed but restricted — only built-in safe types, registered types, and host-allowed constructors
 - **Properties** (bracket access): `constructor`, `__proto__`, `prototype`, `caller`, `callee`
 - **Syntax**: template literals, generators (`function*`)
 

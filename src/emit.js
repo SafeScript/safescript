@@ -170,6 +170,15 @@ function emit(node) {
     case 'SequenceExpression':
       return '(' + node.expressions.map(emit).join(', ') + ')';
 
+    case 'NewExpression':
+      // new Constructor(args) → (await __new(Constructor, [args]))
+      var newCalleeStr = emit(node.callee);
+      var newArgs = node.arguments.map(function(a) {
+        if (a.type === 'SpreadElement') return '...' + emit(a.argument);
+        return emit(a);
+      }).join(', ');
+      return '(await __new(' + newCalleeStr + ', [' + newArgs + ']))';
+
     case 'CallExpression':
       // Method call on non-computed member: obj.method(args) → __call(obj, "method", args)
       if (node.callee.type === 'MemberExpression' && !node.callee.computed) {

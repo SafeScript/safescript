@@ -17,6 +17,9 @@ var createSafeTimers   = require('./safe-timers').createSafeTimers;
 var createSanitizer    = require('./sanitizer').createSanitizer;
 var createURLPolicy    = require('./url-policy').createURLPolicy;
 var createEventBridge  = require('./event-bridge').createEventBridge;
+var createSafeWindow   = require('./safe-window').createSafeWindow;
+var createSafeJQuery   = require('./safe-jquery').createSafeJQuery;
+var createSafeQ        = require('./safe-q').createSafeQ;
 
 /**
  * Default tag allowlist — safe subset of HTML.
@@ -179,6 +182,15 @@ function createDOMContext(root, policy) {
   // ── Safe timers ───────────────────────────────────────────────
   var timers = createSafeTimers(budgets);
 
+  // ── SafeWindow facade ────────────────────────────────────────
+  var safeWin = createSafeWindow(context, budgets);
+
+  // ── Safe$ jQuery facade ──────────────────────────────────────
+  var safe$ = createSafeJQuery(context);
+
+  // ── SafeQ framework bridge ───────────────────────────────────
+  var safeQResult = createSafeQ(context, safe$);
+
   // ── Account existing children toward budget ───────────────────
   var initialNodes = budgets.countSubtreeNodes(root);
   budgets.setNodeCount(initialNodes);
@@ -186,6 +198,10 @@ function createDOMContext(root, policy) {
   // ── Scope additions for SafeScript ────────────────────────────
   var scope = {
     document:      safeDoc,
+    window:        safeWin.facade,
+    $:             safe$,
+    jQuery:        safe$,
+    Q:             safeQResult.facade,
     setTimeout:    timers.setTimeout,
     clearTimeout:  timers.clearTimeout,
     setInterval:   timers.setInterval,
@@ -204,6 +220,8 @@ function createDOMContext(root, policy) {
     context: context,
     cleanup: function() {
       timers.cleanup();
+      if (safeWin.cleanup) safeWin.cleanup();
+      if (safeQResult.cleanup) safeQResult.cleanup();
       if (context.eventBridge && context.eventBridge.cleanup) {
         context.eventBridge.cleanup();
       }
@@ -222,3 +240,6 @@ exports.DEFAULT_EVENTS = DEFAULT_EVENTS;
 // v1.3 type name exports
 exports.SafeDOMDocument = 'SafeDOMDocument';
 exports.SafeHTMLElement = 'SafeHTMLElement';
+exports.SafeWindow = 'SafeWindow';
+exports.SafeJQuery = 'SafeJQuery';
+exports.SafeQ = 'SafeQ';

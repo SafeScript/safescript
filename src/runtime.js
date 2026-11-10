@@ -20,7 +20,14 @@ var MAX_OPS     = 100000000; // 100M ops
 var _typeRegistry = new Map();
 
 // Built-in constructors whose methods are always safe to call
-var SAFE_CTORS = [Error, TypeError, RangeError, SyntaxError, ReferenceError];
+var SAFE_CTORS = [Error, TypeError, RangeError, SyntaxError, ReferenceError,
+                  Map, Set, Date, RegExp];
+
+// Built-in constructors allowed with `new` — always available
+var SAFE_NEW_CTORS = [
+  Map, Set, Date, RegExp,
+  Error, TypeError, RangeError, SyntaxError, ReferenceError
+];
 
 function registerType(ctor, config) {
   if (typeof ctor !== 'function') {
@@ -181,6 +188,117 @@ function __call_opt(obj, method) {
 }
 
 /**
+ * Safe `new` operator: new Constructor(args) → __new(Constructor, argsArray)
+ *
+ * Allowed constructors:
+ *   1. Built-in safe constructors (Map, Set, Date, RegExp, Error family)
+ *   2. Host-registered types (via SafeScript.lib(Ctor, { allowMethods: [...] }))
+ *   3. Host-allowed constructors (via opts.allowNew: [Ctor1, Ctor2])
+ * Everything else throws.
+ */
+function __new(ctor, args) {
+  if (typeof ctor !== 'function') {
+    throw new TypeError('SafeScript: new requires a constructor function');
+  }
+
+  // 1. Built-in safe constructors
+  for (var i = 0; i < SAFE_NEW_CTORS.length; i++) {
+    if (ctor === SAFE_NEW_CTORS[i]) {
+      return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+    }
+  }
+
+  // 2. Host-registered types (type registry)
+  if (_typeRegistry.has(ctor)) {
+    return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+  }
+
+  // 3. Host-allowed constructors (via _allowNewCtors, set per-execution)
+  if (_allowNewCtors) {
+    for (var j = 0; j < _allowNewCtors.length; j++) {
+      if (ctor === _allowNewCtors[j]) {
+        return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+      }
+    }
+  }
+
+  throw new Error('SafeScript: constructor ' + (ctor.name || '(anonymous)') +
+    ' is not allowed with new — register with SafeScript.lib() or pass in opts.allowNew');
+}
+
+// Per-execution allow list (set by buildFunction from opts.allowNew)
+var _allowNewCtors = null;
+
+/**
+ * Sanitize a return value to POD (Plain Old Data).
+ * Strips functions, keeps primitives, plain objects, arrays,
+ * and instances of safe built-in types (Date, RegExp, Map, Set, Error family).
+ * Handles cycles via a seen-set.
+ */
+function sanitizeReturn(val, _seen) {
+  // Primitives pass through
+  if (val === null || val === undefined) return val;
+  var t = typeof val;
+  if (t === 'string' || t === 'number' || t === 'boolean' || t === 'bigint') return val;
+
+  // Functions are stripped
+  if (t === 'function') return undefined;
+
+  if (t !== 'object') return undefined;
+
+  // Cycle detection
+  if (!_seen) _seen = new Map();
+  if (_seen.has(val)) return _seen.get(val);
+
+  // Arrays — recursively sanitize elements
+  if (Array.isArray(val)) {
+    var arr = [];
+    _seen.set(val, arr);
+    for (var i = 0; i < val.length; i++) {
+      arr[i] = sanitizeReturn(val[i], _seen);
+    }
+    return arr;
+  }
+
+  // Safe built-in instances pass through as-is
+  if (val instanceof Date || val instanceof RegExp ||
+      val instanceof Map || val instanceof Set) {
+    return val;
+  }
+  for (var j = 0; j < SAFE_CTORS.length; j++) {
+    if (val instanceof SAFE_CTORS[j]) return val;
+  }
+
+  // Registered type instances pass through
+  var proto = Object.getPrototypeOf(val);
+  if (proto !== null && proto !== Object.prototype) {
+    var ctor = val.constructor;
+    if (ctor && _typeRegistry.has(ctor)) return val;
+    // Check parent constructors
+    var p = proto;
+    while (p && p !== Object.prototype) {
+      var pc = p.constructor;
+      if (pc && _typeRegistry.has(pc)) return val;
+      p = Object.getPrototypeOf(p);
+    }
+    // Unregistered non-plain object — return undefined
+    return undefined;
+  }
+
+  // Plain objects — recursively sanitize values, strip function values
+  var out = Object.create(null);
+  _seen.set(val, out);
+  var keys = Object.keys(val);
+  for (var k = 0; k < keys.length; k++) {
+    var sv = sanitizeReturn(val[keys[k]], _seen);
+    if (sv !== undefined || val[keys[k]] === undefined) {
+      out[keys[k]] = sv;
+    }
+  }
+  return out;
+}
+
+/**
  * Deep-copy an object to null-prototype objects.
  * Functions pass through (they're trusted API).
  * Handles cycles via a seen-set.
@@ -333,12 +451,18 @@ function buildSafeGlobals() {
     stringify: JSON.stringify,
   });
 
-  // Error constructors (all work without new in JS)
+  // Error constructors
   sg.Error = Error;
   sg.TypeError = TypeError;
   sg.RangeError = RangeError;
   sg.SyntaxError = SyntaxError;
   sg.ReferenceError = ReferenceError;
+
+  // v1.4: Built-in constructors available with `new`
+  sg.Map = Map;
+  sg.Set = Set;
+  sg.Date = Date;
+  sg.RegExp = RegExp;
 
   // Standalone functions
   sg.parseInt = parseInt;
@@ -581,7 +705,11 @@ function buildFunction(source, scope, opts) {
   }
 
   if (needsDOM) {
-    var createDOMContext = require('./dom/index').createDOMContext;
+    var createDOMContext;
+    try { createDOMContext = require('./dom/index').createDOMContext; } catch(e) {}
+    if (!createDOMContext) {
+      throw new Error('SafeScript: DOM membrane is not available in this environment. Provide DOM access via scope instead.');
+    }
     domContext = createDOMContext(opts.dom.root, opts.dom.policy);
     // Inject DOM globals into scope
     var domScope = domContext.scope;
@@ -629,8 +757,11 @@ function buildFunction(source, scope, opts) {
   var thisPreamble = 'var __safeThis = __thisCell.value; __thisCell.value = undefined;\n';
   var body = '"use strict";\n' + shadowDecl + safeAssign + thisPreamble + source;
 
-  // Function params: __scope, __at, __set, __call, __call_opt, __check, __thisCell, __safeGlobals, then scope keys
-  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__check', '__thisCell', '__safeGlobals'].concat(scopeKeys);
+  // Host-allowed constructors for `new` (from opts.allowNew)
+  var allowNew = opts.allowNew || null;
+
+  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, then scope keys
+  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals'].concat(scopeKeys);
 
   // Always use AsyncFunction constructor (auto-async model)
   var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
@@ -675,8 +806,11 @@ function buildFunction(source, scope, opts) {
       invocationGlobals = buildSafeGlobalsWithRandom(mulberry32(seed));
     }
 
+    // Set per-execution allowNew list
+    _allowNewCtors = allowNew;
+
     // Bind the arguments
-    var args = [scopeObj, __at, __set, __call, __call_opt, __check, thisCell, invocationGlobals];
+    var args = [scopeObj, __at, __set, __call, __call_opt, __new, __check, thisCell, invocationGlobals];
     for (var i = 0; i < scopeKeys.length; i++) {
       args.push(scopeObj[scopeKeys[i]]);
     }
@@ -690,22 +824,36 @@ function buildFunction(source, scope, opts) {
       }
     }
 
+    // v1.4: Sanitize return value to POD (strip functions, keep data)
+    // Can be disabled with opts.rawReturn for internal/trusted use
+    var shouldSanitizeReturn = !opts.rawReturn;
+
     // Promise.race as secondary defense (catches slow async injected methods)
     if (timeout > 0) {
       var timer;
       return Promise.race([
-        promise.then(function(v) { clearTimeout(timer); cleanupDOM(); return v; },
-                     function(e) { clearTimeout(timer); cleanupDOM(); throw e; }),
+        promise.then(function(v) {
+          clearTimeout(timer); cleanupDOM(); _allowNewCtors = null;
+          return shouldSanitizeReturn ? sanitizeReturn(v) : v;
+        }, function(e) {
+          clearTimeout(timer); cleanupDOM(); _allowNewCtors = null;
+          throw e;
+        }),
         new Promise(function(_, reject) {
           timer = setTimeout(function() {
-            cleanupDOM();
+            cleanupDOM(); _allowNewCtors = null;
             reject(new Error('SafeScript: execution timed out after ' + timeout + 'ms'));
           }, timeout);
         })
       ]);
     }
-    return promise.then(function(v) { cleanupDOM(); return v; },
-                        function(e) { cleanupDOM(); throw e; });
+    return promise.then(function(v) {
+      cleanupDOM(); _allowNewCtors = null;
+      return shouldSanitizeReturn ? sanitizeReturn(v) : v;
+    }, function(e) {
+      cleanupDOM(); _allowNewCtors = null;
+      throw e;
+    });
   };
 }
 
@@ -713,6 +861,8 @@ exports.__at = __at;
 exports.__set = __set;
 exports.__call = __call;
 exports.__call_opt = __call_opt;
+exports.__new = __new;
+exports.sanitizeReturn = sanitizeReturn;
 exports.sanitize = sanitize;
 exports.buildShadowList = buildShadowList;
 exports.buildFunction = buildFunction;

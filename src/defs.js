@@ -35,7 +35,7 @@ var BLOCKED = Object.create(null);
 // Blocked keywords
 var BLOCKED_KW = Object.create(null);
 [
-  'new', 'delete', 'class', 'extends', 'super',
+  'delete', 'class', 'extends', 'super',
   'with', 'import', 'export', 'debugger', 'yield',
   'async', 'await',
 ].forEach(function(k) { BLOCKED_KW[k] = 1; });
@@ -48,7 +48,7 @@ var ALLOWED_KW = Object.create(null);
   'break', 'continue', 'return', 'function',
   'try', 'catch', 'finally', 'throw',
   'switch', 'case', 'default',
-  'typeof', 'void', 'in', 'of',
+  'typeof', 'void', 'in', 'of', 'new',
   'true', 'false', 'null', 'undefined',
   'instanceof',
   'this',

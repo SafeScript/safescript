@@ -64,29 +64,29 @@ function parseHeader(source) {
       continue;
     }
 
-    // @needs <name>: <Type>
-    m = line.match(/^@needs\s+(\w+)\s*:\s*(.+)$/);
+    // @needs <name>: <Type>  (name may be $ or a word)
+    m = line.match(/^@needs\s+([\w$]+)\s*:\s*(.+)$/);
     if (m) {
       result.needs.push({ name: m[1], type: m[2].trim() });
       continue;
     }
 
     // @needs <name> (no type)
-    m = line.match(/^@needs\s+(\w+)\s*$/);
+    m = line.match(/^@needs\s+([\w$]+)\s*$/);
     if (m) {
       result.needs.push({ name: m[1], type: null });
       continue;
     }
 
-    // @uses <name>: <Type>
-    m = line.match(/^@uses\s+(\w+)\s*:\s*(.+)$/);
+    // @uses <name>: <Type>  (name may be $ or a word)
+    m = line.match(/^@uses\s+([\w$]+)\s*:\s*(.+)$/);
     if (m) {
       result.uses.push({ name: m[1], type: m[2].trim() });
       continue;
     }
 
     // @uses <name> (no type)
-    m = line.match(/^@uses\s+(\w+)\s*$/);
+    m = line.match(/^@uses\s+([\w$]+)\s*$/);
     if (m) {
       result.uses.push({ name: m[1], type: null });
       continue;
@@ -143,6 +143,10 @@ var BUILTIN_TYPES = {
   'SafeHTMLElement': { scopeKey: null,       provider: 'dom' },  // provided via DOM context
   // Window
   'SafeWindow':      { scopeKey: 'window',   provider: 'window' },
+  // jQuery
+  'SafeJQuery':      { scopeKey: '$',        provider: 'dom' },
+  // Qbix framework
+  'SafeQ':           { scopeKey: 'Q',        provider: 'dom' },
   // Console
   'SafeConsole':     { scopeKey: 'console',  provider: 'console' },
   // Observers (IntersectionObserver, MutationObserver, ResizeObserver)

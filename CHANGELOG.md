@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.4.0] — 2026-11-08
+
+### Added
+- **`new` keyword**: `new` is now allowed with a constructor whitelist. Built-in safe constructors (`Map`, `Set`, `Date`, `RegExp`, `Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`) are always available. Host-registered types (via `SafeScript.lib()`) and host-allowed constructors (via `opts.allowNew: [Ctor]`) also work. Unregistered constructors throw at runtime.
+- **`__new` runtime guard**: `new Constructor(args)` compiles to `__new(Constructor, [args])`, which checks the constructor against the whitelist before instantiation.
+- **Safe globals**: `Map`, `Set`, `Date`, `RegExp` are now exposed in safe globals (previously shadowed) so `new` can reference them.
+- **`SAFE_CTORS` expanded**: `Map`, `Set`, `Date`, `RegExp` instances can now have their methods called without type registration.
+- **Return value sanitization**: `run()` now sanitizes return values to POD (plain old data). Functions are stripped, primitives and plain objects/arrays pass through, instances of safe built-in types (`Date`, `Map`, `Set`, `RegExp`, `Error` family) and registered types pass through. Use `opts.rawReturn: true` to disable.
+- **`opts.allowNew`**: Array of constructors the host allows `new` to call, beyond the built-in safe list and the type registry.
+- **`opts.rawReturn`**: When true, skips return value sanitization (returns raw value including functions).
+- `test-v1.4.js`: 30 tests covering `new` keyword, constructor whitelist, return sanitization, and side effects.
+
+### Changed
+- `src/defs.js`: `new` moved from `BLOCKED_KW` to `ALLOWED_KW`.
+- `src/parse.js`: Added `NewExpression` parsing in `_parseUnary()`.
+- `src/emit.js`: Added `NewExpression` emitter → `__new(Constructor, [args])`.
+- `src/runtime.js`: Added `__new()`, `sanitizeReturn()`, `SAFE_NEW_CTORS`. Updated `buildFunction()` to pass `__new` and sanitize return values.
+- `browser.js`: `__new` wired through bundle automatically via runtime module.
+- **Q.handle hardening** (from v1.3 patch): `safeQ.handle()` now rejects string handlers (sandbox escape via global function lookup). Only `Function`, `Q.Event`, and arrays of those are accepted. String handlers inside `Q.Event.handlers` arrays are also stripped.
+
 ## [1.3.0] — 2026-10-25
 
 ### Added

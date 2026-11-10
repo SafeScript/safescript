@@ -127,7 +127,7 @@ shouldFail('process.exit()', 'process', 'Blocked identifier: process');
 shouldFail('setTimeout(fn, 0)', 'setTimeout', 'Blocked identifier: setTimeout');
 
 // Blocked keywords
-shouldFail('new Object()', 'new keyword', 'Blocked keyword: new');
+// v1.4: `new` is now allowed (whitelisted constructors only, runtime-checked)
 shouldFail('delete obj.x', 'delete keyword', 'Blocked keyword: delete');
 shouldFail('class Foo {}', 'class keyword', 'Blocked keyword: class');
 shouldFail('async function f() {}', 'async keyword', 'Blocked keyword: async');
