@@ -811,5 +811,6 @@ function resolveContext(handle) {
 }
 
 exports.createSafeHandle = createSafeHandle;
+exports.createSafeHTMLElement = createSafeHandle;  // v1.3 alias
 exports.resolveNode = resolveNode;
 exports.resolveContext = resolveContext;

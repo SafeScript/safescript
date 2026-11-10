@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.3.0] — 2026-10-25
+
+### Added
+- **Type renames**: `SafeHandle` → `SafeHTMLElement`, `SafeDocument` → `SafeDOMDocument`. Legacy aliases removed from type registry and BUILTIN_TYPES (factory function aliases retained for migration).
+- **`@uses` directive wiring**: `@uses document: SafeDOMDocument` now auto-injects the DOM membrane context into the SafeScript scope. The header parser resolves built-in types and the runtime activates the corresponding providers.
+- `SafeScript.types` — built-in type name registry (`SafeDOMDocument`, `SafeHTMLElement`, `SafeWindow`, `SafeConsole`, `SafeObservers`, `SafeCanvas`, `SafeMedia`, `SafeNavigation`, and legacy aliases).
+- `SafeScript.resolveUses(header)` — resolve `@uses` directives against built-in type registry. Returns provider flags: `dom`, `window`, `console`, `observers`, `canvas`, `media`, `navigation`.
+- `header.resolveUses()` — maps `@uses` type names to built-in providers.
+- `header.BUILTIN_TYPES` — registry of built-in type names and their providers.
+- **6 new built-in types** for `@uses` directives:
+  - `SafeWindow` — `window.innerWidth/Height`, `scrollY`, resize events, `matchMedia`, `getComputedStyle`, `open()`
+  - `SafeConsole` — `console.log/warn/error`
+  - `SafeObservers` — `IntersectionObserver`, `MutationObserver`, `ResizeObserver`
+  - `SafeCanvas` — `canvas.getContext('2d')`, SVG manipulation
+  - `SafeMedia` — `new Audio()`, `<video>`, `Blob`, `URL.createObjectURL`
+  - `SafeNavigation` — `location.hash`, `history.pushState/replaceState`
+- `load()` now returns `{ source, scope, header }` bundles so `run()` can use the parsed header.
+- `run()` now parses the header and passes it to the runtime for `@uses` auto-injection.
+
+### Changed
+- `src/runtime.js`: `buildFunction()` checks `opts.header` for `@uses` directives and auto-activates DOM context when `SafeDOMDocument` is declared.
+- `src/dom/safe-handle.js`: Added `createSafeHTMLElement` export alias.
+- `src/dom/safe-document.js`: Added `createSafeDOMDocument` export alias.
+- `src/dom/index.js`: Added type name exports (`SafeDOMDocument`, `SafeHTMLElement`).
+
 ## [1.2.0] — 2026-10-25
 
 ### Added

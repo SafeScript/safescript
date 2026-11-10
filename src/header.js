@@ -128,5 +128,71 @@ function checkScope(header, scope) {
   return { ok: missing.length === 0, missing: missing };
 }
 
+/**
+ * Built-in type registry — maps @uses type names to their built-in providers.
+ * When the runtime sees one of these types in @uses, it knows how to
+ * auto-inject the corresponding scope without host configuration.
+ *
+ * Each entry: { scopeKey: string, provider: string }
+ *   scopeKey  — the scope variable name injected (e.g. 'document')
+ *   provider  — which built-in provider to activate ('dom')
+ */
+var BUILTIN_TYPES = {
+  // DOM types
+  'SafeDOMDocument': { scopeKey: 'document', provider: 'dom' },
+  'SafeHTMLElement': { scopeKey: null,       provider: 'dom' },  // provided via DOM context
+  // Window
+  'SafeWindow':      { scopeKey: 'window',   provider: 'window' },
+  // Console
+  'SafeConsole':     { scopeKey: 'console',  provider: 'console' },
+  // Observers (IntersectionObserver, MutationObserver, ResizeObserver)
+  'SafeObservers':   { scopeKey: null,       provider: 'observers' },
+  // Canvas / 2D drawing
+  'SafeCanvas':      { scopeKey: null,       provider: 'canvas' },
+  // Audio / Video / Blob / URL.createObjectURL
+  'SafeMedia':       { scopeKey: null,       provider: 'media' },
+  // location.hash, history.pushState/replaceState
+  'SafeNavigation':  { scopeKey: null,       provider: 'navigation' }
+};
+
+/**
+ * Resolve @uses directives against the built-in type registry.
+ * Returns which built-in providers need to be activated.
+ *
+ * @param {Object} header - Parsed header from parseHeader()
+ * @returns {{ dom: boolean, usesEntries: Array }} Providers to activate
+ */
+function resolveUses(header) {
+  var result = {
+    dom: false,
+    window: false,
+    console: false,
+    observers: false,
+    canvas: false,
+    media: false,
+    navigation: false,
+    usesEntries: []
+  };
+  if (!header || !header.uses) return result;
+
+  for (var i = 0; i < header.uses.length; i++) {
+    var entry = header.uses[i];
+    var typeName = entry.type;
+    if (typeName && BUILTIN_TYPES[typeName]) {
+      var builtin = BUILTIN_TYPES[typeName];
+      result[builtin.provider] = true;
+      result.usesEntries.push({
+        name: entry.name,
+        type: typeName,
+        builtin: builtin
+      });
+    }
+  }
+
+  return result;
+}
+
 exports.parseHeader = parseHeader;
 exports.checkScope = checkScope;
+exports.resolveUses = resolveUses;
+exports.BUILTIN_TYPES = BUILTIN_TYPES;

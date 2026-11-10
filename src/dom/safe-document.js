@@ -188,5 +188,6 @@ function createSafeDocument(context) {
 }
 
 exports.createSafeDocument = createSafeDocument;
+exports.createSafeDOMDocument = createSafeDocument;  // v1.3 alias
 exports.isClobberingName = isClobberingName;
 exports.BLOCKED_DOCUMENT_PROPS = BLOCKED_DOCUMENT_PROPS;

@@ -13,6 +13,8 @@
  *   SafeScript.capabilities(source)   → { version, env, needs, uses, types }
  *   SafeScript.checkScope(source, scope) → { ok, missing }
  *   SafeScript.load(source, resolver)    → Promise<bundle> (one-call integration)
+ *   SafeScript.resolveUses(header)       → { dom, window, console, observers, canvas, media, navigation, usesEntries } (v1.3)
+ *   SafeScript.types                     → built-in type names (v1.3)
  */
 'use strict';
 
@@ -51,14 +53,22 @@ var SafeScript = {
    * @returns {Promise<*>} A Promise resolving to the return value of the SafeScript code
    */
   run: function(source, scope, opts) {
-    // Bundle overload: run({ source, scope })
+    // Bundle overload: run({ source, scope, header })
+    var parsedHeader = null;
     if (typeof source === 'object' && source !== null && typeof source.source === 'string') {
       opts = scope; // second arg becomes opts in bundle mode
       scope = source.scope;
+      parsedHeader = source.header || null;
       source = source.source;
     }
+    // v1.3: Parse header for @uses directives and pass to runtime
+    if (!parsedHeader) {
+      parsedHeader = header.parseHeader(source);
+    }
+    var runOpts = opts || {};
+    runOpts.header = parsedHeader;
     var compiled = compiler.compile(source);
-    var fn = runtime.buildFunction(compiled.code, scope, opts || {});
+    var fn = runtime.buildFunction(compiled.code, scope, runOpts);
     return fn();
   },
 
@@ -180,7 +190,7 @@ var SafeScript = {
           }
         }
       }
-      return { source: source, scope: scope };
+      return { source: source, scope: scope, header: caps };
     });
   },
 
@@ -278,5 +288,20 @@ var SafeScript = {
     return SafeScript.run(source, scope);
   }
 };
+
+// v1.3: Built-in type names for @uses directives
+SafeScript.types = {
+  SafeDOMDocument: 'SafeDOMDocument',
+  SafeHTMLElement: 'SafeHTMLElement',
+  SafeWindow: 'SafeWindow',
+  SafeConsole: 'SafeConsole',
+  SafeObservers: 'SafeObservers',
+  SafeCanvas: 'SafeCanvas',
+  SafeMedia: 'SafeMedia',
+  SafeNavigation: 'SafeNavigation'
+};
+
+// v1.3: Resolve @uses directives against built-in types
+SafeScript.resolveUses = header.resolveUses;
 
 module.exports = SafeScript;

@@ -563,9 +563,24 @@ function buildFunction(source, scope, opts) {
   var scopeObj = scope ? sanitize(scope) : Object.create(null);
   var scopeKeys = scope ? Object.keys(scope) : [];
 
-  // DOM Membrane: create context and inject scope additions
+  // DOM Membrane: create context and inject scope additions.
+  // Two paths trigger DOM injection:
+  //   1. Explicit opts.dom.root (host passes a root element directly)
+  //   2. @uses directive with a built-in DOM type (e.g. @uses document: SafeDOMDocument)
+  //      — requires opts.dom.root so the runtime knows WHERE to mount
   var domContext = null;
-  if (opts.dom && opts.dom.root) {
+  var needsDOM = opts.dom && opts.dom.root;
+
+  // v1.3: Check @uses directives for built-in DOM types
+  if (!needsDOM && opts.header) {
+    var resolveUses = require('./header').resolveUses;
+    var resolved = resolveUses(opts.header);
+    if (resolved.dom && opts.dom && opts.dom.root) {
+      needsDOM = true;
+    }
+  }
+
+  if (needsDOM) {
     var createDOMContext = require('./dom/index').createDOMContext;
     domContext = createDOMContext(opts.dom.root, opts.dom.policy);
     // Inject DOM globals into scope

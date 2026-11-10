@@ -218,3 +218,7 @@ exports.mergePolicy = mergePolicy;
 exports.DEFAULT_TAGS = DEFAULT_TAGS;
 exports.DEFAULT_ATTRIBUTES = DEFAULT_ATTRIBUTES;
 exports.DEFAULT_EVENTS = DEFAULT_EVENTS;
+
+// v1.3 type name exports
+exports.SafeDOMDocument = 'SafeDOMDocument';
+exports.SafeHTMLElement = 'SafeHTMLElement';
