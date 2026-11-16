@@ -41,7 +41,8 @@ function debugRun(source, scope, opts) {
     onError: opts.onError || function() {},
     onLog: opts.onLog || null,
     breakpoints: opts.breakpoints,
-    captureAllLocals: opts.captureAllLocals
+    captureAllLocals: opts.captureAllLocals,
+    pauseOn: opts.pauseOn || 'after' // tests expect post-execution locals by default
   });
   return session;
 }
@@ -502,6 +503,139 @@ await test('logpoint with failed expr shows error text', async function() {
   assert(logs.length >= 1, 'onLog fired');
   // Should contain error text for the failed interpolation
   assert(logs[0].message.indexOf('val is') === 0, 'static part preserved');
+  s.stop();
+});
+
+// 7. Before/After Checkpoints
+// ══════════════════════════════════════════════════════════════════
+
+console.log('\n══ Before/After Checkpoints ══\n');
+
+await test('pauseOn: before pauses before line executes', async function() {
+  var pauses = [];
+  var s = SafeScript.debug('var x = 10;\nvar y = 20;\nreturn x + y;', {}, {
+    pauseOn: 'before',
+    captureAllLocals: true,
+    onPause: function(info) { pauses.push(info); }
+  });
+  await tick();
+  assert(pauses.length >= 1, 'should have paused');
+  eq(pauses[0].phase, 'before', 'phase is before');
+  eq(pauses[0].line, 1, 'at line 1');
+  assert(pauses[0].locals.x === undefined, 'x not yet set');
+  s.stop();
+});
+
+await test('pauseOn: after pauses after line executes', async function() {
+  var pauses = [];
+  var s = SafeScript.debug('var x = 10;\nvar y = 20;\nreturn x + y;', {}, {
+    pauseOn: 'after',
+    captureAllLocals: true,
+    onPause: function(info) { pauses.push(info); }
+  });
+  await tick();
+  assert(pauses.length >= 1, 'should have paused');
+  eq(pauses[0].phase, 'after', 'phase is after');
+  eq(pauses[0].line, 1, 'at line 1');
+  eq(pauses[0].locals.x, 10, 'x is set after execution');
+  s.stop();
+});
+
+await test('pauseOn: both pauses at before AND after', async function() {
+  var pauses = [];
+  var s = SafeScript.debug('var x = 10;\nvar y = 20;', {}, {
+    pauseOn: 'both',
+    captureAllLocals: true,
+    onPause: function(info) { pauses.push({ line: info.line, phase: info.phase }); }
+  });
+  await tick();
+  assert(pauses.length >= 1, 'paused at before');
+  eq(pauses[0].phase, 'before', 'first pause is before');
+
+  s.step(); await tick();
+  eq(pauses[pauses.length - 1].phase, 'after', 'second pause is after');
+  eq(pauses[pauses.length - 1].line, 1, 'still line 1');
+
+  s.step(); await tick();
+  eq(pauses[pauses.length - 1].phase, 'before', 'third pause is before');
+  eq(pauses[pauses.length - 1].line, 2, 'now line 2');
+
+  s.stop();
+});
+
+await test('setPauseOn changes mode at runtime', async function() {
+  var pauses = [];
+  var s = SafeScript.debug('var x = 1;\nvar y = 2;\nvar z = 3;\nreturn z;', {}, {
+    pauseOn: 'before',
+    captureAllLocals: true,
+    onPause: function(info) { pauses.push({ line: info.line, phase: info.phase }); }
+  });
+  await tick();
+  eq(pauses[0].phase, 'before', 'starts in before mode');
+
+  s.setPauseOn('after');
+  s.step(); await tick();
+
+  var last = pauses[pauses.length - 1];
+  eq(last.phase, 'after', 'switched to after mode');
+  eq(last.line, 1, 'at line 1 after');
+  s.stop();
+});
+
+await test('breakpoints fire on before phase by default', async function() {
+  var pauses = [];
+  var s = SafeScript.debug('var x = 1;\nvar y = 2;\nvar z = 3;\nreturn z;', {}, {
+    pauseOn: 'before',
+    captureAllLocals: true,
+    breakpoints: [3],
+    onPause: function(info) { pauses.push(info); }
+  });
+  await tick();
+  s.continue(); await tick();
+
+  var bpPause = pauses[pauses.length - 1];
+  eq(bpPause.line, 3, 'breakpoint at line 3');
+  eq(bpPause.phase, 'before', 'breakpoint fires on before');
+  assert(bpPause.locals.z === undefined, 'z not set yet (before)');
+  s.stop();
+});
+
+await test('history includes phase on each entry', async function() {
+  var s = debugRun('var x = 1;\nvar y = 2;', {}, { captureAllLocals: true });
+  await tick();
+  s.step(); await tick();
+  s.step(); await tick();
+
+  var hist = s.getHistory();
+  assert(hist.length >= 2, 'should have history');
+  var phases = hist.map(function(h) { return h.phase; });
+  assert(phases.indexOf('before') !== -1, 'has before entries');
+  assert(phases.indexOf('after') !== -1, 'has after entries');
+  s.stop();
+});
+
+await test('fork copies pauseOn setting', async function() {
+  var s = debugRun('var x = 1;\nreturn x;', {}, { pauseOn: 'both' });
+  await tick();
+  eq(s.pauseOn, 'both', 'parent is both');
+
+  var child = s.fork();
+  eq(child.pauseOn, 'both', 'fork copies pauseOn');
+
+  child.setPauseOn('after');
+  eq(child.pauseOn, 'after', 'child changed');
+  eq(s.pauseOn, 'both', 'parent unchanged');
+  s.stop();
+});
+
+await test('serialize/deserialize preserves pauseOn', async function() {
+  var s = debugRun('var x = 1;\nreturn x;', {}, {
+    captureAllLocals: true,
+    pauseOn: 'both'
+  });
+  await tick();
+  var data = s.serialize();
+  eq(data.pauseOn, 'both', 'serialized pauseOn');
   s.stop();
 });
 

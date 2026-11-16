@@ -13,6 +13,7 @@ var defs = require('./defs');
 // Hardcoded ceilings — even if host passes higher, these cap it
 var MAX_TIMEOUT = 60000;   // 1 minute
 var MAX_OPS     = 100000000; // 100M ops
+var MAX_MEMORY  = 64 * 1024 * 1024; // 64 MB — estimated allocation budget
 
 // ── Type registry ────────────────────────────────────────────────
 // Maps constructor → { allowMethods: string[] }
@@ -751,6 +752,9 @@ function buildFunction(source, scope, opts) {
   var maxOps = opts.maxOps || MAX_OPS;
   if (maxOps > MAX_OPS) maxOps = MAX_OPS;
 
+  var maxMemory = opts.maxMemory || MAX_MEMORY;
+  if (maxMemory > MAX_MEMORY) maxMemory = MAX_MEMORY;
+
   // Shadow all globals
   var shadowList = buildShadowList();
   var shadowDecl = shadowList.length > 0 ?
@@ -817,6 +821,30 @@ function buildFunction(source, scope, opts) {
     hookState.startTime = Date.now();
     thisCell.value = undefined; // reset for each invocation
 
+    // Memory tracking: estimated total bytes allocated (upper bound, no GC tracking)
+    var memUsed = 0;
+
+    function estimateSize(val) {
+      if (val == null) return 0;
+      var t = typeof val;
+      if (t === 'string') return 40 + val.length * 2;
+      if (t === 'number' || t === 'boolean') return 16;
+      if (t === 'function') return 128;
+      if (Array.isArray(val)) return 64 + val.length * 8;
+      if (t === 'object') {
+        var keys = Object.keys(val);
+        return 64 + keys.length * 32;
+      }
+      return 16;
+    }
+
+    function trackAlloc(bytes) {
+      memUsed += bytes;
+      if (memUsed > maxMemory) {
+        throw new Error('SafeScript: estimated memory limit exceeded (' + (maxMemory / (1024 * 1024)) + ' MB)');
+      }
+    }
+
     // __check: called at top of every function and every loop iteration
     function __check() {
       if (--opsRemaining <= 0) {
@@ -830,23 +858,83 @@ function buildFunction(source, scope, opts) {
     // Build per-invocation safe globals (with fresh RNG state if seed is set)
     var invocationGlobals;
     if (seed === null) {
-      // seed: null — use true Math.random (requires env: { Random: true }, checked at compile)
       invocationGlobals = buildSafeGlobalsWithRandom(Math.random);
     } else {
-      // Deterministic RNG — fresh mulberry32 state per invocation
       invocationGlobals = buildSafeGlobalsWithRandom(mulberry32(seed));
     }
+
+    // Wrap allocation-producing safe globals with memory tracking
+    var origObjCreate = invocationGlobals.Object.create;
+    var origArrayFrom = invocationGlobals.Array.from;
+    var origArrayOf = invocationGlobals.Array.of;
+    var origJsonParse = invocationGlobals.JSON.parse;
+
+    invocationGlobals.Object = Object.freeze({
+      create: function(proto) { var r = origObjCreate(proto); trackAlloc(64); return r; },
+      keys: Object.keys, values: Object.values, entries: Object.entries,
+      assign: Object.assign, freeze: Object.freeze, isFrozen: Object.isFrozen,
+      getOwnPropertyNames: Object.getOwnPropertyNames
+    });
+    invocationGlobals.Array = Object.freeze({
+      isArray: Array.isArray,
+      from: function() { var r = origArrayFrom.apply(null, arguments); trackAlloc(estimateSize(r)); return r; },
+      of: function() { var r = origArrayOf.apply(null, arguments); trackAlloc(estimateSize(r)); return r; }
+    });
+    invocationGlobals.JSON = Object.freeze({
+      parse: function(text, reviver) { var r = origJsonParse(text, reviver); trackAlloc(estimateSize(r) + (typeof text === 'string' ? text.length : 0)); return r; },
+      stringify: JSON.stringify
+    });
 
     // Set per-execution allowNew list
     _allowNewCtors = allowNew;
 
     // Create __dbg checkpoint function (no-op if not debugging)
     var __dbg;
-    // In debug mode, wrap __at/__set/__call to route through journal
+    // Wrap __at/__set/__call — memory tracking always, journal routing in debug mode
     var effectiveAt = __at;
-    var effectiveSet = __set;
-    var effectiveCall = __call;
-    var effectiveCallOpt = __call_opt;
+
+    // Memory-tracking __set: counts bytes for new property additions
+    var effectiveSet = function(obj, key, val) {
+      if (obj == null) {
+        throw new TypeError('Cannot set property "' + key + '" of ' + String(obj));
+      }
+      var k = String(key);
+      if (defs.BLOCKED_PROPS[k]) {
+        throw new TypeError('SafeScript: cannot set blocked property "' + k + '"');
+      }
+      if (!(k in obj)) {
+        trackAlloc(32 + estimateSize(val));
+      }
+      obj[k] = val;
+      return val;
+    };
+
+    // Memory-tracking __new: counts bytes for constructor result
+    var baseNew = __new;
+    var effectiveNew = function(ctor) {
+      var result = baseNew.apply(undefined, arguments);
+      trackAlloc(estimateSize(result));
+      return result;
+    };
+
+    // Memory-tracking __call wrapper: tracks results of methods that allocate
+    var ALLOC_METHODS = { map:1, filter:1, concat:1, slice:1, flat:1, flatMap:1, splice:1,
+      split:1, repeat:1, padStart:1, padEnd:1, join:1, replace:1, replaceAll:1,
+      trim:1, trimStart:1, trimEnd:1, substring:1, substr:1, toUpperCase:1, toLowerCase:1 };
+    var effectiveCall = function(obj, method) {
+      var result = __call.apply(undefined, arguments);
+      if (ALLOC_METHODS[method] && result != null) {
+        trackAlloc(estimateSize(result));
+      }
+      return result;
+    };
+    var effectiveCallOpt = function(obj, method) {
+      var result = __call_opt.apply(undefined, arguments);
+      if (ALLOC_METHODS[method] && result != null) {
+        trackAlloc(estimateSize(result));
+      }
+      return result;
+    };
 
     if (debugSession) {
       __dbg = debugSession.createCheckpoint();
@@ -866,7 +954,7 @@ function buildFunction(source, scope, opts) {
         return obj[k];
       };
 
-      // Journal-aware __set: writes to journal, not real object
+      // Journal-aware __set: writes to journal + memory tracking
       effectiveSet = function(obj, key, val) {
         if (obj == null) {
           throw new TypeError('Cannot set property "' + key + '" of ' + String(obj));
@@ -874,6 +962,9 @@ function buildFunction(source, scope, opts) {
         var k = String(key);
         if (defs.BLOCKED_PROPS[k]) {
           throw new TypeError('SafeScript: cannot set blocked property "' + k + '"');
+        }
+        if (!(k in obj)) {
+          trackAlloc(32 + estimateSize(val));
         }
         // Resolve to original object for journal tracking
         var origObj = (_debugOriginals && _debugOriginals.has(obj)) ? _debugOriginals.get(obj) : obj;
@@ -891,9 +982,8 @@ function buildFunction(source, scope, opts) {
         return val;
       };
 
-      // Journal-aware __call: logs the call as a side effect
+      // Journal-aware __call: logs the call as a side effect + memory tracking
       effectiveCall = function(obj, method) {
-        // Log the call
         var callArgs = [];
         for (var ci = 2; ci < arguments.length; ci++) {
           callArgs.push(arguments[ci]);
@@ -901,8 +991,11 @@ function buildFunction(source, scope, opts) {
         debugSession._effectLog.push({
           kind: 'call', target: obj, method: method, args: callArgs
         });
-        // Delegate to the real __call
-        return __call.apply(undefined, arguments);
+        var result = __call.apply(undefined, arguments);
+        if (ALLOC_METHODS[method] && result != null) {
+          trackAlloc(estimateSize(result));
+        }
+        return result;
       };
 
       effectiveCallOpt = function(obj, method) {
@@ -914,14 +1007,18 @@ function buildFunction(source, scope, opts) {
         debugSession._effectLog.push({
           kind: 'call', target: obj, method: method, args: callArgs, optional: true
         });
-        return __call_opt.apply(undefined, arguments);
+        var result = __call_opt.apply(undefined, arguments);
+        if (ALLOC_METHODS[method] && result != null) {
+          trackAlloc(estimateSize(result));
+        }
+        return result;
       };
     } else {
       __dbg = async function() { return null; };
     }
 
     // Bind the arguments
-    var args = [scopeObj, effectiveAt, effectiveSet, effectiveCall, effectiveCallOpt, __new, __check, thisCell, invocationGlobals, __dbg];
+    var args = [scopeObj, effectiveAt, effectiveSet, effectiveCall, effectiveCallOpt, effectiveNew, __check, thisCell, invocationGlobals, __dbg];
 
     // Store runtime args on the debug session for edit-and-continue
     // (compileTail needs these to build the replacement function)
@@ -1002,3 +1099,4 @@ exports.getRegisteredTypes = function() {
 };
 exports.MAX_TIMEOUT = MAX_TIMEOUT;
 exports.MAX_OPS = MAX_OPS;
+exports.MAX_MEMORY = MAX_MEMORY;

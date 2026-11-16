@@ -93,6 +93,14 @@ The reverse lookup is bidirectional: given any DOM element, `getNodeTimeline(ele
 
 `session.setLogpoint(line, template)` fires a message when a line is reached without pausing. Templates support `{expr}` interpolation against current locals (evaluated through SafeScript, not raw eval). Via the protocol: `setLogpoint` / `removeLogpoint` commands, `logpoint` event. Preserved across fork and serialize.
 
+### Before/After Checkpoints (v2.0)
+
+The compiler inserts `__dbg` checkpoints both before and after every statement. `pauseOn: 'before'` (default) gives standard debugger behavior — breakpoints fire before the line executes. `pauseOn: 'after'` pauses after the line runs. `pauseOn: 'both'` pauses at both phases. `setPauseOn(mode)` switches at runtime. Via the protocol: `setPauseOn` command. The `paused` and `stepped` events include a `phase` field.
+
+### Memory Limit (v2.0)
+
+Estimated memory tracking across all instrumented operations — property writes, constructors, array/string methods, `Object.create`, `Array.from`, `JSON.parse`. Default budget: 64 MB (`MAX_MEMORY`), configurable via `maxMemory` option. Throws when cumulative allocations exceed the budget. The estimate is an upper bound (no GC tracking).
+
 ### Web Worker Transport (v2.0)
 
 `SafeScript.runInWorker(self, source, scope, opts)` runs a debug session inside a Web Worker. `SafeScript.createWorkerProxy(worker, opts)` creates a `DebugProxy` on the main thread that mirrors the full DebugSession API.
@@ -109,7 +117,7 @@ SafeScript's safety comes from static analysis and compile-time instrumentation,
 6. **Return sanitization** strips functions from output, preventing capability leaks
 7. **DOM membrane** (v1.3+) scopes DOM access to a container element — scripts can't touch anything outside it
 
-This means SafeScript code is safe to run on the main thread without a Web Worker sandbox, an iframe, or any browser sandbox. The only resource SafeScript code can exhaust is memory (by building large data structures within the operation limit), and even that is bounded by the operation counter. For additional isolation — to prevent a single script from blocking the main thread — run it in a Web Worker using the built-in transport.
+This means SafeScript code is safe to run on the main thread without a Web Worker sandbox, an iframe, or any browser sandbox. Memory is bounded by estimated allocation tracking (default 64 MB). For additional isolation — to prevent a single script from blocking the main thread or exceeding OS-level memory limits — run it in a Web Worker using the built-in transport.
 
 ## Breaking Changes
 
@@ -117,7 +125,7 @@ None. v2.0 is fully backward-compatible with v1.x. The `new` keyword was previou
 
 ## Test Coverage
 
-311 tests across 8 suites:
+330 tests across 9 suites:
 
 - `test.js` — core compiler + runtime (153 tests)
 - `test-v1.4.js` — constructors, return sanitization (30 tests)
@@ -126,7 +134,8 @@ None. v2.0 is fully backward-compatible with v1.x. The `new` keyword was previou
 - `test-edit-continue.js` — edit-and-continue, debug protocol (14 tests)
 - `test-dom-journal.js` — DOM journal integration (15 tests)
 - `test-dom-snapshots.js` — DOM snapshots, reverse lookup, element timeline (21 tests)
-- `test-advanced-debug.js` — evaluate, conditional breakpoints, stepOver/Out, fork, serialize, logpoints (31 tests)
+- `test-advanced-debug.js` — evaluate, conditional breakpoints, stepOver/Out, fork, serialize, logpoints, before/after checkpoints (39 tests)
+- `test-memory.js` — memory limit tracking (11 tests)
 
 ## What's Next
 

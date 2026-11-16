@@ -181,7 +181,7 @@ session.continue();  // runs the new logic with current locals
 
 ### Commands and Events
 
-**25 commands** (driver → engine):
+**26 commands** (driver → engine):
 
 | Command | Data | Effect |
 |---------|------|--------|
@@ -210,13 +210,14 @@ session.continue();  // runs the new logic with current locals
 | `serialize` | — | Export session state |
 | `setLogpoint` | `{ line, template }` | Set logpoint (log without pausing) |
 | `removeLogpoint` | `{ line }` | Remove a logpoint |
+| `setPauseOn` | `{ mode }` | Set checkpoint phase: 'before', 'after', or 'both' |
 
 **18 events** (engine → driver):
 
 | Event | Data | When |
 |-------|------|------|
-| `paused` | `{ line, locals }` | Execution paused |
-| `stepped` | `{ line, step }` | Completed one step |
+| `paused` | `{ line, locals, phase }` | Execution paused (phase: 'before' or 'after') |
+| `stepped` | `{ line, step, phase }` | Completed one step (phase: 'before' or 'after') |
 | `finished` | `{ value }` | Execution completed |
 | `error` | `{ message }` | Runtime error |
 | `committed` | `{ ... }` | Journal committed |
@@ -340,6 +341,49 @@ Key properties:
 - **Preserved across fork/serialize** — `fork()` copies logpoints to the child session; `serialize()` / `deserialize()` round-trip them.
 
 Via the protocol: `setLogpoint` command (data: `{ line, template }`), `removeLogpoint` command (data: `{ line }`), `logpoint` event (data: `{ line, message, step }`).
+
+### Before/After Checkpoints
+
+The compiler inserts `__dbg` checkpoints both before and after every statement. The `pauseOn` option controls which phases trigger a pause:
+
+```js
+// Default: pause before the line executes (standard debugger behavior)
+var session = SafeScript.debug(source, scope, { pauseOn: 'before' });
+
+// Pause after the line executes
+var session = SafeScript.debug(source, scope, { pauseOn: 'after' });
+
+// Both: stepping goes before → after → before → after
+var session = SafeScript.debug(source, scope, { pauseOn: 'both' });
+
+// Switch at runtime
+session.setPauseOn('after');
+```
+
+`pauseOn: 'before'` is the standard debugger model — breakpoints fire before the line runs, so you see the state that led to it. `pauseOn: 'after'` is useful for "what did this line do?" inspection. Both phases fire their checkpoints regardless of the setting (for bookkeeping and journal tagging); only the pause decision respects `pauseOn`.
+
+The `paused` and `stepped` protocol events include a `phase` field (`'before'` or `'after'`). History entries also carry `phase`. Via the protocol: `setPauseOn` command (data: `{ mode }`).
+
+### Memory Limit
+
+SafeScript tracks estimated memory allocation across all instrumented operations:
+
+- **`__set` (property writes)** — new property additions count key overhead + value size
+- **`__new` (constructors)** — the constructed object's estimated size
+- **`__call` (method calls)** — methods that return new values: `map`, `filter`, `concat`, `slice`, `flat`, `flatMap`, `splice`, `split`, `repeat`, `padStart`, `padEnd`, `join`, `replace`, `replaceAll`, `trim`, `substring`, `toUpperCase`, `toLowerCase`
+- **Safe globals** — `Object.create`, `Array.from`, `Array.of`, `JSON.parse`
+
+```js
+// Default: 64 MB budget
+var result = await SafeScript.run(source, scope);
+
+// Custom limit
+var result = await SafeScript.run(source, scope, { maxMemory: 1024 * 1024 }); // 1 MB
+```
+
+The estimate is a cumulative upper bound — it doesn't subtract when GC frees memory. The heuristic estimates strings at 40 + length × 2 bytes (UTF-16), arrays at 64 + length × 8, objects at 64 + keys × 32, primitives at 16. The ceiling (`MAX_MEMORY = 64 MB`) cannot be raised, even by the host.
+
+Array/object literals and string concatenation via `+` are not directly tracked — they are bounded indirectly by the operation counter (`MAX_OPS`), since you can't create more items than the op limit allows.
 
 ### Built-in Transports
 

@@ -217,6 +217,10 @@ DebugProxy.prototype.removeLogpoint = function(line) {
   this._send('removeLogpoint', { line: line });
 };
 
+DebugProxy.prototype.setPauseOn = function(mode) {
+  this._send('setPauseOn', { mode: mode });
+};
+
 /**
  * Disconnect the proxy — stop listening for events.
  */

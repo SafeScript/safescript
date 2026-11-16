@@ -6,11 +6,11 @@
  * WebSocket, TCP, or in-process function calls.
  *
  * The protocol defines:
- *   - 25 Commands (driver → engine): step, continue, stop, stepOver, stepOut,
+ *   - 26 Commands (driver → engine): step, continue, stop, stepOver, stepOut,
  *     setBreakpoints, toggleBreakpoint, runToLine, setConditionalBreakpoint,
  *     editAndContinue, evaluate, rewindTo, commit, discard, getLocals,
  *     getHistory, getJournal, getNodeTimeline, getDOMSnapshots, snapshotDOM,
- *     restoreDOM, fork, serialize, setLogpoint, removeLogpoint
+ *     restoreDOM, fork, serialize, setLogpoint, removeLogpoint, setPauseOn
  *   - 18 Events (engine → driver): paused, stepped, finished, error,
  *     committed, discarded, rewound, locals, history, journal, nodeTimeline,
  *     domSnapshots, domSnapshot, domRestored, evaluated, forked, serialized,
@@ -58,7 +58,8 @@ var COMMANDS = {
   fork: 'fork',
   serialize: 'serialize',
   setLogpoint: 'setLogpoint',
-  removeLogpoint: 'removeLogpoint'
+  removeLogpoint: 'removeLogpoint',
+  setPauseOn: 'setPauseOn'
 };
 
 var EVENTS = {
@@ -106,6 +107,7 @@ function DebugProtocol(session, driver) {
       line: info.line,
       locals: info.locals,
       effects: info.effects,
+      phase: info.phase || null,
       rewound: info.rewound || false,
       state: session.state
     });
@@ -117,6 +119,7 @@ function DebugProtocol(session, driver) {
     self._emit(EVENTS.stepped, {
       index: step.index,
       line: step.line,
+      phase: step.phase || null,
       effects: step.effects || null
     });
   };
@@ -325,6 +328,10 @@ DebugProtocol.prototype.handleCommand = function(msg) {
 
     case COMMANDS.removeLogpoint:
       session.removeLogpoint(data.line);
+      break;
+
+    case COMMANDS.setPauseOn:
+      session.setPauseOn(data.mode);
       break;
 
     default:

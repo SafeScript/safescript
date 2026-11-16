@@ -147,6 +147,7 @@ async function run() {
   await test('locals are captured on pause', async function() {
     var capturedLocals = null;
     var session = SafeScript.debug('var x = 42;\nvar y = "hello";', {}, {
+      pauseOn: 'after',
       onPause: function(info) {
         capturedLocals = info.locals;
       }
@@ -167,6 +168,7 @@ async function run() {
   await test('locals update as execution progresses', async function() {
     var localHistory = [];
     var session = SafeScript.debug('var a = 1;\nvar b = a + 10;\nvar c = b * 2;', {}, {
+      pauseOn: 'after',
       onPause: function(info) {
         localHistory.push(Object.assign({}, info.locals));
       }
@@ -193,6 +195,7 @@ async function run() {
   await test('scope variables are accessible', async function() {
     var capturedLocals = null;
     var session = SafeScript.debug('var result = input * 2;', { input: 21 }, {
+      pauseOn: 'after',
       onPause: function(info) {
         capturedLocals = info.locals;
       }
@@ -383,6 +386,7 @@ async function run() {
   await test('replacement receives current locals', async function() {
     var receivedLocals = null;
     var session = SafeScript.debug('var x = 42;\nvar y = x + 1;\nreturn y;', {}, {
+      pauseOn: 'after',
       onPause: function() {}
     });
 

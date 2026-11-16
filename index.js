@@ -308,7 +308,8 @@ var SafeScript = {
       onCommit: opts.onCommit,
       onLog: opts.onLog,
       breakpoints: opts.breakpoints,
-      captureAllLocals: opts.captureAllLocals
+      captureAllLocals: opts.captureAllLocals,
+      pauseOn: opts.pauseOn
     });
 
     // Parse header

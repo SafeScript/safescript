@@ -94,17 +94,19 @@ function collectPatternNames(pat, names) {
 }
 
 /**
- * Build the __dbg checkpoint call for after a statement.
+ * Build a __dbg checkpoint call.
  * @param {number} line - 1-indexed source line
+ * @param {string} [phase] - 'before' or 'after' (default: 'after')
  * @returns {string} The checkpoint code
  */
-function emitDbgCheckpoint(line) {
+function emitDbgCheckpoint(line, phase) {
   if (!_debugMode || !_debugLocals) return '';
   var names = Object.keys(_debugLocals);
   var localsObj = names.length > 0
     ? '{ ' + names.map(function(n) { return n + ': ' + n; }).join(', ') + ' }'
     : '{}';
-  return '\n__r = await __dbg(' + line + ', function(){ return ' + localsObj + '; });\nif (__r) return __r.value;';
+  var phaseStr = phase === 'before' ? ', "before"' : ', "after"';
+  return '\n__r = await __dbg(' + line + ', function(){ return ' + localsObj + '; }' + phaseStr + ');\nif (__r) return __r.value;';
 }
 
 /**
@@ -141,9 +143,13 @@ function emit(node) {
       return node.body.map(emit).join('\n');
 
     case 'ExpressionStatement':
-      var exprCode = emit(node.expression) + ';';
+      var exprCode = '';
       if (_debugMode) {
-        exprCode += emitDbgCheckpoint(nodeLine(node));
+        exprCode += emitDbgCheckpoint(nodeLine(node), 'before');
+      }
+      exprCode += emit(node.expression) + ';';
+      if (_debugMode) {
+        exprCode += emitDbgCheckpoint(nodeLine(node), 'after');
       }
       return exprCode;
 
@@ -163,12 +169,16 @@ function emit(node) {
           collectPatternNames(node.declarations[vi].id, _debugLocals);
         }
       }
-      var varCode = node.kind + ' ' + node.declarations.map(function(d) {
+      var varCode = '';
+      if (_debugMode) {
+        varCode += emitDbgCheckpoint(nodeLine(node), 'before');
+      }
+      varCode += node.kind + ' ' + node.declarations.map(function(d) {
         if (d.init) return emitPattern(d.id) + ' = ' + emit(d.init);
         return emitPattern(d.id);
       }).join(', ') + ';';
       if (_debugMode) {
-        varCode += emitDbgCheckpoint(nodeLine(node));
+        varCode += emitDbgCheckpoint(nodeLine(node), 'after');
       }
       return varCode;
 
@@ -199,17 +209,20 @@ function emit(node) {
 
     case 'ReturnStatement':
       if (_debugMode && node.argument) {
-        // Emit: var __retVal = <expr>; __dbg checkpoint; return __retVal;
-        return 'var __retVal = ' + emit(node.argument) + ';' +
-          emitDbgCheckpoint(nodeLine(node)) + '\nreturn __retVal;';
+        return emitDbgCheckpoint(nodeLine(node), 'before') +
+          '\nvar __retVal = ' + emit(node.argument) + ';' +
+          emitDbgCheckpoint(nodeLine(node), 'after') + '\nreturn __retVal;';
+      }
+      if (_debugMode) {
+        return emitDbgCheckpoint(nodeLine(node), 'before') + '\nreturn;';
       }
       return node.argument ? 'return ' + emit(node.argument) + ';' : 'return;';
 
     case 'ThrowStatement':
       if (_debugMode) {
-        // Emit checkpoint before throw
-        return '{ var __throwVal = ' + emit(node.argument) + ';' +
-          emitDbgCheckpoint(nodeLine(node)) + '\nthrow __throwVal; }';
+        return '{' + emitDbgCheckpoint(nodeLine(node), 'before') +
+          '\nvar __throwVal = ' + emit(node.argument) + ';' +
+          emitDbgCheckpoint(nodeLine(node), 'after') + '\nthrow __throwVal; }';
       }
       return 'throw ' + emit(node.argument) + ';';
 
@@ -489,9 +502,12 @@ function emitVarDeclNoSemi(node) {
 }
 
 /**
- * Emit in debug mode: inserts __dbg checkpoints after every statement.
+ * Emit in debug mode: inserts __dbg checkpoints before and after every statement.
  * Adds `var __r;` preamble for the checkpoint return-signal variable.
  * Collects all declared variable names for the locals closure.
+ *
+ * Each checkpoint receives a phase argument ('before' or 'after') so
+ * the debug session can decide which phases to pause on.
  */
 function emitDebug(node) {
   // Collect all variable names declared in the program

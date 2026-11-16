@@ -220,9 +220,18 @@ var result = await SafeScript.run(source, scope, { maxOps: 10000 });
 var result = await SafeScript.run(source, scope, { timeout: 5000, maxOps: 50000 });
 ```
 
-**Hardcoded ceilings.** Even if the host omits `timeout` or passes `0`, a ceiling of **60 seconds** (`MAX_TIMEOUT = 60000`) is always enforced. Similarly, `maxOps` is capped at **100 million** (`MAX_OPS = 100000000`). These ceilings cannot be raised — they protect against misconfigured hosts.
+**Memory limit.** SafeScript tracks estimated memory allocation across all instrumented operations — property writes that add new keys, constructor calls, array/string methods that return new values (`map`, `filter`, `concat`, `repeat`, `split`, etc.), `Object.create`, `Array.from`, `JSON.parse`. The default budget is **64 MB** (`MAX_MEMORY`). The host can lower it with `maxMemory`:
 
-`Promise.race` remains as a secondary defense for slow async injected methods, but the primary protection is the `__check()` guards in the compiled code itself.
+```js
+// Limit estimated memory to 1 MB
+var result = await SafeScript.run(source, scope, { maxMemory: 1024 * 1024 });
+```
+
+The estimate is an upper bound on cumulative allocations (no GC tracking), so real heap usage is always lower. Array/object literals and string concatenation via `+` are bounded indirectly by the operation counter.
+
+**Hardcoded ceilings.** Even if the host omits limits or passes larger values, ceilings are always enforced: **60 seconds** (`MAX_TIMEOUT`), **100 million operations** (`MAX_OPS`), **64 MB estimated memory** (`MAX_MEMORY`). These cannot be raised — they protect against misconfigured hosts.
+
+`Promise.race` remains as a secondary defense for slow async injected methods, but the primary protection is the `__check()` guards and memory tracking in the compiled code itself.
 
 ### Hooks
 
@@ -653,11 +662,15 @@ session.continue();    // run to completion (or next breakpoint)
 - `queryNodeHistory(node, prop?)` — journal entries for a DOM node (newest first)
 - `queryNodeSteps(node, prop?)` — step indices where a node was modified
 - `getNodeTimeline(node)` — change history for an element (oldest first)
+- `setLogpoint(line, template)` — log a message when a line is reached, without pausing
+- `removeLogpoint(line)` — remove a logpoint
+- `setPauseOn(mode)` — set checkpoint phase: `'before'` (default), `'after'`, or `'both'`
 - `state` — `'running'`, `'paused'`, `'finished'`, or `'stopped'`
+- `pauseOn` — current checkpoint phase setting
 - `currentLine` — line number where execution is paused
 - `currentLocals` — snapshot of local variables at the pause point
 
-Callbacks: `onPause(info)`, `onStep(step)`, `onFinish(value)`, `onError(err)`, `onCommit(result)`.
+Callbacks: `onPause(info)`, `onStep(step)`, `onFinish(value)`, `onError(err)`, `onCommit(result)`, `onLog(info)`.
 
 ### Journal — Transactional Execution
 
@@ -743,9 +756,9 @@ driver.command('commit');
 | `PostMessageDriver` | Web Worker or iframe — debug session runs off the main thread |
 | `PortDriver` | MessagePort (SharedWorker, BroadcastChannel) |
 
-**25 commands** (driver → engine): `step`, `continue`, `stop`, `stepOver`, `stepOut`, `setBreakpoints`, `toggleBreakpoint`, `runToLine`, `setConditionalBreakpoint`, `editAndContinue`, `evaluate`, `rewindTo`, `commit`, `discard`, `getLocals`, `getHistory`, `getJournal`, `getNodeTimeline`, `getDOMSnapshots`, `snapshotDOM`, `restoreDOM`, `fork`, `serialize`, `setLogpoint`, `removeLogpoint`.
+**26 commands** (driver → engine): `step`, `continue`, `stop`, `stepOver`, `stepOut`, `setBreakpoints`, `toggleBreakpoint`, `runToLine`, `setConditionalBreakpoint`, `editAndContinue`, `evaluate`, `rewindTo`, `commit`, `discard`, `getLocals`, `getHistory`, `getJournal`, `getNodeTimeline`, `getDOMSnapshots`, `snapshotDOM`, `restoreDOM`, `fork`, `serialize`, `setLogpoint`, `removeLogpoint`, `setPauseOn`.
 
-**18 events** (engine → driver): `paused`, `stepped`, `finished`, `error`, `committed`, `discarded`, `rewound`, `locals`, `history`, `journal`, `nodeTimeline`, `domSnapshots`, `domSnapshot`, `domRestored`, `evaluated`, `forked`, `serialized`, `logpoint`.
+**18 events** (engine → driver): `paused`, `stepped`, `finished`, `error`, `committed`, `discarded`, `rewound`, `locals`, `history`, `journal`, `nodeTimeline`, `domSnapshots`, `domSnapshot`, `domRestored`, `evaluated`, `forked`, `serialized`, `logpoint`. The `paused` and `stepped` events include a `phase` field (`'before'` or `'after'`).
 
 Third-party transports (SafeStudio, xdebug-style debuggers) implement the same interface. A driver is any object with a `send(event)` method and an `onMessage(callback)` method.
 
@@ -909,6 +922,28 @@ session.removeLogpoint(5);  // stop logging at line 5
 
 Via the protocol: `setLogpoint` / `removeLogpoint` commands, `logpoint` event. Logpoints are preserved across `fork()` and `serialize()` / `deserialize()`.
 
+### Before/After Checkpoints
+
+The compiler inserts `__dbg` checkpoints both **before** and **after** every statement. The session's `pauseOn` setting controls which phases can trigger a pause:
+
+```js
+// Default: pause before the line executes (standard debugger behavior)
+var session = SafeScript.debug(source, scope, { pauseOn: 'before' });
+
+// Pause after the line executes (see the result immediately)
+var session = SafeScript.debug(source, scope, { pauseOn: 'after' });
+
+// Pause at both phases (before → inspect arriving state, after → inspect result)
+var session = SafeScript.debug(source, scope, { pauseOn: 'both' });
+
+// Switch at runtime
+session.setPauseOn('after');
+```
+
+With `pauseOn: 'before'` (the default), setting a breakpoint on line 5 pauses *before* line 5 runs — you see the state that led to it. With `pauseOn: 'after'`, the same breakpoint pauses *after* line 5 runs — you see what it did. With `'both'`, stepping goes before → after → before → after.
+
+The `paused` and `stepped` protocol events include a `phase` field (`'before'` or `'after'`) so the driver knows which checkpoint fired. Via the protocol: `setPauseOn` command (data: `{ mode }`).
+
 ### Real-World Example: DOM Container
 
 A complete example of loading SafeScript, scoping it to a DOM container, and running it — safely, with no ability to touch anything outside the container:
@@ -961,8 +996,9 @@ SafeScript code is safe to run on the main thread without a Web Worker, iframe, 
 - Return functions (capabilities are stripped)
 - Read or write DOM outside its container
 - Run forever (operation limit + timeout)
+- Allocate unbounded memory (estimated memory tracking, default 64 MB budget)
 
-The only resource a SafeScript can exhaust is memory — by building large data structures within the operation limit. For most use cases this is bounded by the operation counter. For untrusted code from the internet, running in a Web Worker via the built-in transport adds memory isolation without code changes to the `.safe` file.
+For additional isolation — to prevent a single script from blocking the main thread or exceeding OS-level memory limits — run it in a Web Worker via the built-in transport.
 
 ## Specification
 
@@ -1000,7 +1036,8 @@ node test-journal.js        # v2.0: journal, time travel, commit/discard (23 tes
 node test-edit-continue.js  # v2.0: edit-and-continue, debug protocol (14 tests)
 node test-dom-journal.js    # v2.0: DOM journal integration (15 tests)
 node test-dom-snapshots.js  # v2.0: DOM snapshots, reverse lookup, element timeline (21 tests)
-node test-advanced-debug.js # v2.0: evaluate, conditional breakpoints, stepOver/Out, fork, serialize (24 tests)
+node test-advanced-debug.js # v2.0: evaluate, conditional breakpoints, stepOver/Out, fork, serialize, logpoints, before/after (39 tests)
+node test-memory.js         # v2.0: memory limit tracking (11 tests)
 node test-dom.js            # DOM membrane security tests
 node test-type-registry.js  # type registry — method whitelisting
 node test-type-header.js    # @type header declarations + load() validation

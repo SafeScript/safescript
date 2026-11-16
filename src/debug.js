@@ -2,7 +2,9 @@
  * SafeScript 2.0 — Debug runtime.
  *
  * DebugSession: breakpoints, step/continue/stop, edit-and-continue.
- * __dbg: checkpoint function injected after every statement in debug mode.
+ * __dbg: checkpoint function injected before and after every statement in debug mode.
+ * The session's `pauseOn` setting ('before', 'after', or 'both') controls which
+ * phases can trigger a pause. Default is 'before' (standard debugger behavior).
  *
  * The pause mechanism is `await` — __dbg returns a Promise that doesn't
  * resolve until the user acts (step, continue, stop). The browser event
@@ -22,6 +24,7 @@ var Journal = require('./journal').Journal;
  * @param {Function} [opts.onError]  - Called on runtime error
  * @param {Array<number>} [opts.breakpoints] - Initial breakpoint line numbers
  * @param {boolean} [opts.captureAllLocals] - Capture locals at every step, not just pauses
+ * @param {string} [opts.pauseOn] - Which checkpoint phases to pause on: 'before', 'after', or 'both'. Default: 'before'.
  */
 function DebugSession(opts) {
   opts = opts || {};
@@ -38,6 +41,7 @@ function DebugSession(opts) {
     }
   }
   this.stepping = true;           // start paused at first statement
+  this.pauseOn = opts.pauseOn || 'before'; // 'before' | 'after' | 'both'
   this._stepMode = 'into';       // 'into' | 'over' | 'out'
   this._stepDepth = 0;           // call depth when stepOver/stepOut was issued
   this._callDepth = 0;           // current call depth (tracked by __dbg)
@@ -136,6 +140,16 @@ DebugSession.prototype.stop = function() {
     var r = this.resume;
     this.resume = null;
     r('__stop');
+  }
+};
+
+/**
+ * Set which checkpoint phases to pause on at runtime.
+ * @param {string} mode - 'before', 'after', or 'both'
+ */
+DebugSession.prototype.setPauseOn = function(mode) {
+  if (mode === 'before' || mode === 'after' || mode === 'both') {
+    this.pauseOn = mode;
   }
 };
 
@@ -364,6 +378,7 @@ DebugSession.prototype.fork = function() {
   // Copy state
   child.state = this.state;
   child.stepping = this.stepping;
+  child.pauseOn = this.pauseOn;
   child.currentLine = this.currentLine;
   child._callDepth = this._callDepth;
 
@@ -469,6 +484,7 @@ DebugSession.prototype.serialize = function() {
     version: 1,
     state: this.state,
     stepping: this.stepping,
+    pauseOn: this.pauseOn,
     currentLine: this.currentLine,
     currentLocals: this.currentLocals,
     callDepth: this._callDepth,
@@ -509,6 +525,7 @@ DebugSession.deserialize = function(data, objectResolver) {
   // Restore state
   session.state = data.state;
   session.stepping = data.stepping;
+  session.pauseOn = data.pauseOn || 'before';
   session.currentLine = data.currentLine;
   session.currentLocals = data.currentLocals;
   session._callDepth = data.callDepth || 0;
@@ -788,99 +805,176 @@ DebugSession.prototype.getLocals = function() {
  * Create a __dbg checkpoint function bound to this session.
  *
  * The returned function is injected into the compiled code's scope.
- * It is called after every statement:
+ * It is called before and after every statement:
  *
- *   __r = await __dbg(LINE, function(){ return { var1: var1, ... }; });
+ *   __r = await __dbg(LINE, function(){ return { var1: var1, ... }; }, "before");
+ *   <statement>
+ *   __r = await __dbg(LINE, function(){ return { var1: var1, ... }; }, "after");
  *   if (__r) return __r.value;
+ *
+ * The session's `pauseOn` setting ('before', 'after', or 'both') controls
+ * which phases can trigger a pause. Phases the client doesn't want are
+ * still traversed (for bookkeeping) but never pause.
  */
 DebugSession.prototype.createCheckpoint = function() {
   var session = this;
 
-  return async function __dbg(line, getLocals) {
+  return async function __dbg(line, getLocals, phase) {
     if (session.state === 'finished') return null;
 
-    // Drain the effect log into history
-    var effects = session._effectLog.length > 0 ? session._effectLog.splice(0) : null;
+    // Check if this phase is one the client wants to pause on
+    var phaseActive = (session.pauseOn === 'both') ||
+                      (session.pauseOn === phase);
 
-    // Record this step
-    var stepIdx = session.history.length;
-    var step = {
-      index: stepIdx,
-      line: line,
-      effects: effects
-    };
+    if (phase === 'before') {
+      // Drain the effect log into history
+      var effects = session._effectLog.length > 0 ? session._effectLog.splice(0) : null;
 
-    // Tell the journal which step we're on (so writes are tagged)
-    session.journal.setStepIndex(stepIdx);
+      // Record this step
+      var stepIdx = session.history.length;
+      var step = {
+        index: stepIdx,
+        line: line,
+        phase: 'before',
+        effects: effects
+      };
 
-    // Check logpoints — fire before pause logic, never pauses
-    if (session._logpoints[line]) {
-      var logMessage = session._evaluateLogpoint(session._logpoints[line], getLocals);
-      if (session.onLog) {
-        session.onLog({ line: line, message: logMessage, step: stepIdx });
-      }
-    }
+      // Tell the journal which step we're on (so writes are tagged)
+      session.journal.setStepIndex(stepIdx);
 
-    // Determine if we should pause
-    var shouldPause = false;
-    if (session.stepping) {
-      shouldPause = true;
-    } else if (session._stepMode === 'over' && session._callDepth <= session._stepDepth) {
-      shouldPause = true;
-      session._stepMode = 'into';
-    } else if (session._stepMode === 'out' && session._callDepth < session._stepDepth) {
-      shouldPause = true;
-      session._stepMode = 'into';
-    } else if (session.breakpoints[line]) {
-      // Check conditional breakpoint
-      shouldPause = session._checkCondition(line, getLocals);
-    }
-
-    if (session.captureAllLocals || shouldPause) {
-      step.locals = getLocals();
-    }
-
-    session.history.push(step);
-    session.currentLine = line;
-
-    // Notify host of step (lightweight, even during continue)
-    session.onStep(step);
-
-    // Should we pause?
-    if (shouldPause) {
-      session.state = 'paused';
-      var locals = step.locals || getLocals();
-      session.currentLocals = locals;
-      step.locals = locals;
-
-      session.onPause({ line: line, locals: locals, effects: effects });
-
-      // Clean up one-shot breakpoint
-      if (session._oneShotLine === line) {
-        delete session.breakpoints[line];
-        delete session._oneShotLine;
+      // Check logpoints — fire on 'before', before pause logic
+      if (session._logpoints[line]) {
+        var logMessage = session._evaluateLogpoint(session._logpoints[line], getLocals);
+        if (session.onLog) {
+          session.onLog({ line: line, message: logMessage, step: stepIdx });
+        }
       }
 
-      // Suspend until user acts
-      var signal = await new Promise(function(resolve) {
-        session.resume = resolve;
-      });
-
-      if (signal === '__stop') {
-        session.state = 'finished';
-        throw new Error('SafeScript: debug session stopped');
+      // Determine if we should pause (only if this phase is active)
+      var shouldPause = false;
+      if (phaseActive) {
+        if (session.stepping) {
+          shouldPause = true;
+        } else if (session._stepMode === 'over' && session._callDepth <= session._stepDepth) {
+          shouldPause = true;
+          session._stepMode = 'into';
+        } else if (session._stepMode === 'out' && session._callDepth < session._stepDepth) {
+          shouldPause = true;
+          session._stepMode = 'into';
+        } else if (session.breakpoints[line]) {
+          shouldPause = session._checkCondition(line, getLocals);
+        }
       }
 
-      session.state = 'running';
-    }
+      if (session.captureAllLocals || shouldPause) {
+        step.locals = getLocals();
+      }
 
-    // Check for edit-and-continue replacement
-    if (session.replacement) {
-      var fn = session.replacement;
-      session.replacement = null;
-      var fnLocals = session.currentLocals || getLocals();
-      var result = await fn(fnLocals);
-      return { value: result };
+      session.history.push(step);
+      session.currentLine = line;
+      session._lastBeforeStep = step;
+
+      // Notify host of step
+      session.onStep(step);
+
+      if (shouldPause) {
+        session.state = 'paused';
+        var locals = step.locals || getLocals();
+        session.currentLocals = locals;
+        step.locals = locals;
+
+        session.onPause({ line: line, locals: locals, effects: effects, phase: 'before' });
+
+        // Clean up one-shot breakpoint
+        if (session._oneShotLine === line) {
+          delete session.breakpoints[line];
+          delete session._oneShotLine;
+        }
+
+        var signal = await new Promise(function(resolve) {
+          session.resume = resolve;
+        });
+
+        if (signal === '__stop') {
+          session.state = 'finished';
+          throw new Error('SafeScript: debug session stopped');
+        }
+
+        session.state = 'running';
+      }
+
+      // Check for edit-and-continue replacement (on 'before' only)
+      if (session.replacement) {
+        var fn = session.replacement;
+        session.replacement = null;
+        var fnLocals = session.currentLocals || getLocals();
+        var result = await fn(fnLocals);
+        return { value: result };
+      }
+
+    } else {
+      // phase === 'after'
+      // Drain effects from the statement that just executed
+      var afterEffects = session._effectLog.length > 0 ? session._effectLog.splice(0) : null;
+
+      // Update the most recent step with post-execution locals
+      var afterLocals = getLocals();
+      if (session._lastBeforeStep && session._lastBeforeStep.line === line) {
+        session._lastBeforeStep.afterLocals = afterLocals;
+        // Also attach effects to the before-step if it had none
+        if (!session._lastBeforeStep.effects && afterEffects) {
+          session._lastBeforeStep.effects = afterEffects;
+        }
+      }
+
+      // Record an 'after' step entry
+      var afterStepIdx = session.history.length;
+      var afterStep = {
+        index: afterStepIdx,
+        line: line,
+        phase: 'after',
+        effects: afterEffects,
+        locals: (session.captureAllLocals || phaseActive) ? afterLocals : null
+      };
+      session.history.push(afterStep);
+
+      // Notify host
+      session.onStep(afterStep);
+
+      // Pause on 'after' if active
+      if (phaseActive) {
+        var shouldPauseAfter = false;
+        if (session.stepping) {
+          shouldPauseAfter = true;
+        } else if (session._stepMode === 'over' && session._callDepth <= session._stepDepth) {
+          shouldPauseAfter = true;
+          session._stepMode = 'into';
+        } else if (session._stepMode === 'out' && session._callDepth < session._stepDepth) {
+          shouldPauseAfter = true;
+          session._stepMode = 'into';
+        } else if (session.breakpoints[line]) {
+          shouldPauseAfter = session._checkCondition(line, getLocals);
+        }
+
+        if (shouldPauseAfter) {
+          session.state = 'paused';
+          session.currentLocals = afterLocals;
+          session.currentLine = line;
+
+          session.onPause({ line: line, locals: afterLocals, phase: 'after' });
+
+          var afterSignal = await new Promise(function(resolve) {
+            session.resume = resolve;
+          });
+
+          if (afterSignal === '__stop') {
+            session.state = 'finished';
+            throw new Error('SafeScript: debug session stopped');
+          }
+
+          session.state = 'running';
+        }
+      }
     }
 
     return null;

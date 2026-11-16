@@ -223,6 +223,7 @@ async function run() {
     var api = { doSomething: function(x) { return x * 2; } };
     var stepEffects = [];
     var session = SafeScript.debug('var r = api.doSomething(21);', { api: api }, {
+      pauseOn: 'after',
       onStep: function(step) {
         if (step.effects) stepEffects.push.apply(stepEffects, step.effects);
       }
