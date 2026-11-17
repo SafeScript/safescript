@@ -94,7 +94,12 @@ function collectPatternNames(pat, names) {
 }
 
 /**
- * Build a __dbg checkpoint call.
+ * Build a __dbg checkpoint call with try-catch per variable.
+ *
+ * Uses try-catch for each variable reference in the getLocals closure,
+ * so that variables not yet in scope (e.g. function body vars before
+ * their declaration, or vars in nested scopes) don't throw ReferenceError.
+ *
  * @param {number} line - 1-indexed source line
  * @param {string} [phase] - 'before' or 'after' (default: 'after')
  * @returns {string} The checkpoint code
@@ -102,11 +107,15 @@ function collectPatternNames(pat, names) {
 function emitDbgCheckpoint(line, phase) {
   if (!_debugMode || !_debugLocals) return '';
   var names = Object.keys(_debugLocals);
-  var localsObj = names.length > 0
-    ? '{ ' + names.map(function(n) { return n + ': ' + n; }).join(', ') + ' }'
-    : '{}';
   var phaseStr = phase === 'before' ? ', "before"' : ', "after"';
-  return '\n__r = await __dbg(' + line + ', function(){ return ' + localsObj + '; }' + phaseStr + ');\nif (__r) return __r.value;';
+  if (names.length === 0) {
+    return '\n__r = await __dbg(' + line + ', function(){ return {}; }' + phaseStr + ');\nif (__r) return __r.value;';
+  }
+  // Use try-catch per variable to handle vars not yet in scope
+  var safeLocals = 'var __l = {}; ' + names.map(function(n) {
+    return 'try { __l.' + n + ' = ' + n + '; } catch(e) {}';
+  }).join(' ') + ' return __l;';
+  return '\n__r = await __dbg(' + line + ', function(){ ' + safeLocals + ' }' + phaseStr + ');\nif (__r) return __r.value;';
 }
 
 /**
@@ -163,15 +172,16 @@ function emit(node) {
       return ';';
 
     case 'VariableDeclaration':
-      // In debug mode, register new variable names into _debugLocals
+      var varCode = '';
+      if (_debugMode) {
+        // "before" checkpoint — only already-known vars captured (via try-catch)
+        varCode += emitDbgCheckpoint(nodeLine(node), 'before');
+      }
       if (_debugMode && _debugLocals) {
+        // Register new names AFTER the before-checkpoint so "after" includes them
         for (var vi = 0; vi < node.declarations.length; vi++) {
           collectPatternNames(node.declarations[vi].id, _debugLocals);
         }
-      }
-      var varCode = '';
-      if (_debugMode) {
-        varCode += emitDbgCheckpoint(nodeLine(node), 'before');
       }
       varCode += node.kind + ' ' + node.declarations.map(function(d) {
         if (d.init) return emitPattern(d.id) + ' = ' + emit(d.init);
@@ -186,13 +196,13 @@ function emit(node) {
       return 'async function ' +
         (node.id ? emit(node.id) : '') +
         '(' + node.params.map(emitParam).join(', ') + ') ' +
-        emitFuncBodyWithCheck(node.body);
+        emitFuncBodyWithCheck(node.body, node);
 
     case 'FunctionExpression':
       return 'async function' +
         (node.id ? ' ' + emit(node.id) : '') +
         '(' + node.params.map(emitParam).join(', ') + ') ' +
-        emitFuncBodyWithCheck(node.body);
+        emitFuncBodyWithCheck(node.body, node);
 
     case 'ArrowFunctionExpression':
       var paramsStr;
@@ -391,7 +401,7 @@ function emit(node) {
         if (prop.method) {
           var fn = prop.value;
           return 'async ' + (prop.computed ? '[' + emit(prop.key) + ']' : emit(prop.key)) +
-            '(' + fn.params.map(emitParam).join(', ') + ') ' + emitFuncBodyWithCheck(fn.body);
+            '(' + fn.params.map(emitParam).join(', ') + ') ' + emitFuncBodyWithCheck(fn.body, fn);
         }
         var keyStr = prop.computed ? '[' + emit(prop.key) + ']' : emit(prop.key);
         return keyStr + ': ' + emit(prop.value);
@@ -423,10 +433,25 @@ function emitBodyWithCheck(blockNode) {
  * Captures __safeThis from __thisCell, then resets the cell.
  * Arrow functions do NOT get this — they inherit __safeThis lexically.
  */
-function emitFuncBodyWithCheck(blockNode) {
+function emitFuncBodyWithCheck(blockNode, funcNode) {
   if (_debugMode) {
-    return '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n' +
+    // Save outer locals and build a fresh scope for this function
+    var outerLocals = _debugLocals;
+    _debugLocals = Object.create(null);
+    // Copy outer locals (scope chain — functions close over outer vars)
+    if (outerLocals) { for (var k in outerLocals) _debugLocals[k] = true; }
+    // Add function params to scope
+    if (funcNode && funcNode.params) {
+      for (var pi = 0; pi < funcNode.params.length; pi++) {
+        collectPatternNames(funcNode.params[pi], _debugLocals);
+      }
+    }
+    // Pre-collect body-level var declarations (hoisted to function scope)
+    collectDeclaredNames(blockNode, _debugLocals);
+    var code = '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n' +
       emitStatementsWithDbg(blockNode.body) + '\n}';
+    _debugLocals = outerLocals; // restore outer scope
+    return code;
   }
   return '{\nvar __safeThis = __thisCell.value; __thisCell.value = undefined;\n__check();\n' +
     blockNode.body.map(emit).join('\n') + '\n}';
