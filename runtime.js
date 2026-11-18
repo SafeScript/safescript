@@ -13,6 +13,7 @@ var defs = require('./defs');
 // Hardcoded ceilings — even if host passes higher, these cap it
 var MAX_TIMEOUT = 60000;   // 1 minute
 var MAX_OPS     = 100000000; // 100M ops
+var MAX_MEMORY  = 64 * 1024 * 1024; // 64 MB — estimated allocation budget
 
 // ── Type registry ────────────────────────────────────────────────
 // Maps constructor → { allowMethods: string[] }
@@ -20,7 +21,43 @@ var MAX_OPS     = 100000000; // 100M ops
 var _typeRegistry = new Map();
 
 // Built-in constructors whose methods are always safe to call
-var SAFE_CTORS = [Error, TypeError, RangeError, SyntaxError, ReferenceError];
+var SAFE_CTORS = [Error, TypeError, RangeError, SyntaxError, ReferenceError,
+                  Map, Set, Date, RegExp];
+
+// ── ReDoS guard ─────────────────────────────────────────────────
+// String methods that accept a regex (or are called on a RegExp)
+var REGEX_METHODS = {
+  test: true, match: true, matchAll: true, exec: true,
+  search: true, replace: true, replaceAll: true, split: true
+};
+var REGEX_INPUT_MAX = 102400; // 100KB — no legitimate tool needs to regex-match more
+var NESTED_QUANTIFIER_RE = /(\+|\*|\?|\{[0-9,]+\})\s*\)?(\+|\*|\?|\{)/;
+
+function _checkRegexSafety(args, method) {
+  var pattern = null;
+  var input = null;
+  for (var i = 0; i < args.length; i++) {
+    var a = args[i];
+    if (a instanceof RegExp) {
+      pattern = a.source;
+    } else if (typeof a === 'string' && input === null) {
+      input = a;
+    }
+  }
+  if (input !== null && input.length > REGEX_INPUT_MAX) {
+    throw new Error('SafeScript: regex input too large (' + input.length +
+      ' chars, max ' + REGEX_INPUT_MAX + ')');
+  }
+  if (pattern && NESTED_QUANTIFIER_RE.test(pattern)) {
+    throw new Error('SafeScript: regex pattern contains nested quantifiers (ReDoS risk): /' + pattern + '/');
+  }
+}
+
+// Built-in constructors allowed with `new` — always available
+var SAFE_NEW_CTORS = [
+  Map, Set, Date, RegExp,
+  Error, TypeError, RangeError, SyntaxError, ReferenceError
+];
 
 function registerType(ctor, config) {
   if (typeof ctor !== 'function') {
@@ -100,6 +137,10 @@ function __call(obj, method) {
   if (t === 'string' || t === 'number' || t === 'boolean') {
     var fn = obj[method];
     if (typeof fn !== 'function') return undefined;
+    // ReDoS guard: check regex methods on strings for dangerous patterns
+    if (t === 'string' && REGEX_METHODS[method]) {
+      _checkRegexSafety(args, method);
+    }
     return fn.apply(obj, args);
   }
 
@@ -181,13 +222,180 @@ function __call_opt(obj, method) {
 }
 
 /**
+ * Safe `new` operator: new Constructor(args) → __new(Constructor, argsArray)
+ *
+ * Allowed constructors:
+ *   1. Built-in safe constructors (Map, Set, Date, RegExp, Error family)
+ *   2. Host-registered types (via SafeScript.lib(Ctor, { allowMethods: [...] }))
+ *   3. Host-allowed constructors (via opts.allowNew: [Ctor1, Ctor2])
+ * Everything else throws.
+ */
+function __new(ctor, args) {
+  if (typeof ctor !== 'function') {
+    throw new TypeError('SafeScript: new requires a constructor function');
+  }
+
+  // Resolve through scope wrapper to the original constructor
+  var original = ctor.__original || ctor;
+
+  // 1. Built-in safe constructors
+  for (var i = 0; i < SAFE_NEW_CTORS.length; i++) {
+    if (ctor === SAFE_NEW_CTORS[i] || original === SAFE_NEW_CTORS[i]) {
+      return new (Function.prototype.bind.apply(original, [null].concat(args)))();
+    }
+  }
+
+  // 2. Host-registered types (type registry)
+  if (_typeRegistry.has(ctor) || _typeRegistry.has(original)) {
+    return new (Function.prototype.bind.apply(original, [null].concat(args)))();
+  }
+
+  // 3. Host-allowed constructors (via _allowNewCtors, set per-execution)
+  if (_allowNewCtors) {
+    for (var j = 0; j < _allowNewCtors.length; j++) {
+      if (ctor === _allowNewCtors[j] || original === _allowNewCtors[j]) {
+        return new (Function.prototype.bind.apply(original, [null].concat(args)))();
+      }
+    }
+  }
+
+  throw new Error('SafeScript: constructor ' + (ctor.name || '(anonymous)') +
+    ' is not allowed with new — register with SafeScript.lib() or pass in opts.allowNew');
+}
+
+// Per-execution allow list (set by buildFunction from opts.allowNew)
+var _allowNewCtors = null;
+
+/**
+ * Sanitize a return value to POD (Plain Old Data).
+ * Strips functions, keeps primitives, plain objects, arrays,
+ * and instances of safe built-in types (Date, RegExp, Map, Set, Error family).
+ * Handles cycles via a seen-set.
+ */
+function sanitizeReturn(val, _seen) {
+  // Primitives pass through
+  if (val === null || val === undefined) return val;
+  var t = typeof val;
+  if (t === 'string' || t === 'number' || t === 'boolean' || t === 'bigint') return val;
+
+  // Functions are stripped
+  if (t === 'function') return undefined;
+
+  if (t !== 'object') return undefined;
+
+  // Cycle detection
+  if (!_seen) _seen = new Map();
+  if (_seen.has(val)) return _seen.get(val);
+
+  // Arrays — recursively sanitize elements
+  if (Array.isArray(val)) {
+    var arr = [];
+    _seen.set(val, arr);
+    for (var i = 0; i < val.length; i++) {
+      arr[i] = sanitizeReturn(val[i], _seen);
+    }
+    return arr;
+  }
+
+  // Safe built-in instances pass through as-is
+  if (val instanceof Date || val instanceof RegExp ||
+      val instanceof Map || val instanceof Set) {
+    return val;
+  }
+  for (var j = 0; j < SAFE_CTORS.length; j++) {
+    if (val instanceof SAFE_CTORS[j]) return val;
+  }
+
+  // Registered type instances pass through
+  var proto = Object.getPrototypeOf(val);
+  if (proto !== null && proto !== Object.prototype) {
+    var ctor = val.constructor;
+    if (ctor && _typeRegistry.has(ctor)) return val;
+    // Check parent constructors
+    var p = proto;
+    while (p && p !== Object.prototype) {
+      var pc = p.constructor;
+      if (pc && _typeRegistry.has(pc)) return val;
+      p = Object.getPrototypeOf(p);
+    }
+    // Unregistered non-plain object — return undefined
+    return undefined;
+  }
+
+  // Plain objects — recursively sanitize values, strip function values
+  var out = Object.create(null);
+  _seen.set(val, out);
+  var keys = Object.keys(val);
+  for (var k = 0; k < keys.length; k++) {
+    var sv = sanitizeReturn(val[keys[k]], _seen);
+    if (sv !== undefined || val[keys[k]] === undefined) {
+      out[keys[k]] = sv;
+    }
+  }
+  return out;
+}
+
+/**
  * Deep-copy an object to null-prototype objects.
  * Functions pass through (they're trusted API).
  * Handles cycles via a seen-set.
  */
+
+// ── Scope function wrapping ─────────────────────────────────────
+// Wraps scope functions so .toString()/.toSource() return "[host]"
+// instead of leaking host source code. Wrapper is frozen.
+var _wrappedFns = new WeakMap();
+function _wrapScopeFunction(fn) {
+  if (_wrappedFns.has(fn)) return _wrappedFns.get(fn);
+  var wrapper = function () { return fn.apply(this, arguments); };
+  wrapper.toString = function () { return 'function ' + (fn.name || '') + '() { [host] }'; };
+  wrapper.toSource = wrapper.toString;
+  wrapper.__original = fn; // for __new registry lookup
+  wrapper.prototype = fn.prototype; // for instanceof checks
+  Object.defineProperty(wrapper, 'length', { value: fn.length });
+  Object.defineProperty(wrapper, 'name', { value: fn.name || '' });
+  Object.freeze(wrapper);
+  _wrappedFns.set(fn, wrapper);
+  return wrapper;
+}
+
+// ── Error stack stripping ───────────────────────────────────────
+// Strips .stack from errors to prevent leaking server paths.
+function __stripErr(err) {
+  _stripStack(err);
+}
+
+function _stripStack(err) {
+  if (err && typeof err === 'object' && err.stack) {
+    try {
+      Object.defineProperty(err, 'stack', {
+        get: function () { return (err.constructor.name || 'Error') + ': ' + (err.message || ''); },
+        set: function () {},
+        configurable: true
+      });
+    } catch (e) { /* non-configurable — ignore */ }
+  }
+  return err;
+}
+
+function _makeSafeErrorCtor(NativeError) {
+  var SafeError = function (msg) {
+    var e = new NativeError(msg);
+    Object.defineProperty(e, 'stack', {
+      get: function () { return NativeError.name + ': ' + (e.message || ''); },
+      set: function () {},
+      configurable: true
+    });
+    return e;
+  };
+  SafeError.prototype = NativeError.prototype;
+  Object.defineProperty(SafeError, 'name', { value: NativeError.name });
+  return Object.freeze(SafeError);
+}
+
 function sanitize(obj, _seen) {
   if (obj === null || obj === undefined) return obj;
-  if (typeof obj === 'function') return obj;
+  if (typeof obj === 'function') return _wrapScopeFunction(obj);
   if (typeof obj !== 'object') return obj;
 
   if (!_seen) _seen = new Map();
@@ -333,12 +541,18 @@ function buildSafeGlobals() {
     stringify: JSON.stringify,
   });
 
-  // Error constructors (all work without new in JS)
-  sg.Error = Error;
-  sg.TypeError = TypeError;
-  sg.RangeError = RangeError;
-  sg.SyntaxError = SyntaxError;
-  sg.ReferenceError = ReferenceError;
+  // Error constructors — wrapped to strip .stack (prevents server path leaks)
+  sg.Error = _makeSafeErrorCtor(Error);
+  sg.TypeError = _makeSafeErrorCtor(TypeError);
+  sg.RangeError = _makeSafeErrorCtor(RangeError);
+  sg.SyntaxError = _makeSafeErrorCtor(SyntaxError);
+  sg.ReferenceError = _makeSafeErrorCtor(ReferenceError);
+
+  // v1.4: Built-in constructors available with `new`
+  sg.Map = Map;
+  sg.Set = Set;
+  sg.Date = Date;
+  sg.RegExp = RegExp;
 
   // Standalone functions
   sg.parseInt = parseInt;
@@ -359,6 +573,13 @@ function buildSafeGlobals() {
 
 // Singleton — safe globals are the same for every execution (no Math.random)
 var SAFE_GLOBALS = buildSafeGlobals();
+
+// Add wrapped Error constructors to SAFE_NEW_CTORS so `new Error(...)` works
+// (the safe globals replace native Error ctors with stack-stripping wrappers)
+SAFE_NEW_CTORS.push(
+  SAFE_GLOBALS.Error, SAFE_GLOBALS.TypeError, SAFE_GLOBALS.RangeError,
+  SAFE_GLOBALS.SyntaxError, SAFE_GLOBALS.ReferenceError
+);
 
 // Names of safe globals that should be assigned in the compiled body
 var SAFE_GLOBAL_NAMES = Object.keys(SAFE_GLOBALS);
@@ -563,11 +784,34 @@ function buildFunction(source, scope, opts) {
   var scopeObj = scope ? sanitize(scope) : Object.create(null);
   var scopeKeys = scope ? Object.keys(scope) : [];
 
-  // DOM Membrane: create context and inject scope additions
+  // DOM Membrane: create context and inject scope additions.
+  // Two paths trigger DOM injection:
+  //   1. Explicit opts.dom.root (host passes a root element directly)
+  //   2. @uses directive with a built-in DOM type (e.g. @uses document: SafeDOMDocument)
+  //      — requires opts.dom.root so the runtime knows WHERE to mount
   var domContext = null;
-  if (opts.dom && opts.dom.root) {
-    var createDOMContext = require('./dom/index').createDOMContext;
-    domContext = createDOMContext(opts.dom.root, opts.dom.policy);
+  var needsDOM = opts.dom && opts.dom.root;
+
+  // v1.3: Check @uses directives for built-in DOM types
+  if (!needsDOM && opts.header) {
+    var resolveUses = require('./header').resolveUses;
+    var resolved = resolveUses(opts.header);
+    if (resolved.dom && opts.dom && opts.dom.root) {
+      needsDOM = true;
+    }
+  }
+
+  if (needsDOM) {
+    var createDOMContext;
+    try { createDOMContext = require('./dom/index').createDOMContext; } catch(e) {}
+    if (!createDOMContext) {
+      throw new Error('SafeScript: DOM membrane is not available in this environment. Provide DOM access via scope instead.');
+    }
+    domContext = createDOMContext(opts.dom.root, opts.dom.policy, debugSession);
+    // Tell debug session about the DOM root for snapshots
+    if (debugSession) {
+      debugSession.setDOMRoot(opts.dom.root);
+    }
     // Inject DOM globals into scope
     var domScope = domContext.scope;
     var domKeys = Object.keys(domScope);
@@ -604,6 +848,9 @@ function buildFunction(source, scope, opts) {
   var maxOps = opts.maxOps || MAX_OPS;
   if (maxOps > MAX_OPS) maxOps = MAX_OPS;
 
+  var maxMemory = opts.maxMemory || MAX_MEMORY;
+  if (maxMemory > MAX_MEMORY) maxMemory = MAX_MEMORY;
+
   // Shadow all globals
   var shadowList = buildShadowList();
   var shadowDecl = shadowList.length > 0 ?
@@ -614,8 +861,38 @@ function buildFunction(source, scope, opts) {
   var thisPreamble = 'var __safeThis = __thisCell.value; __thisCell.value = undefined;\n';
   var body = '"use strict";\n' + shadowDecl + safeAssign + thisPreamble + source;
 
-  // Function params: __scope, __at, __set, __call, __call_opt, __check, __thisCell, __safeGlobals, then scope keys
-  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__check', '__thisCell', '__safeGlobals'].concat(scopeKeys);
+  // Host-allowed constructors for `new` (from opts.allowNew)
+  var allowNew = opts.allowNew || null;
+
+  // Debug mode: accept __dbg checkpoint function
+  var debugSession = opts.debugSession || null;
+
+  // In debug mode, build a reverse map: sanitized value → original value
+  // so the journal can record writes against the original objects
+  var _debugOriginals = null;
+  if (debugSession && scope) {
+    _debugOriginals = new Map();
+    var origKeys = Object.keys(scope);
+    for (var oi = 0; oi < origKeys.length; oi++) {
+      var origVal = scope[origKeys[oi]];
+      var sanVal = scopeObj[origKeys[oi]];
+      if (origVal && typeof origVal === 'object' && sanVal && typeof sanVal === 'object') {
+        _debugOriginals.set(sanVal, origVal);
+        // Also map nested objects one level deep
+        var nestedKeys = Object.keys(origVal);
+        for (var ni = 0; ni < nestedKeys.length; ni++) {
+          var nOrig = origVal[nestedKeys[ni]];
+          var nSan = sanVal[nestedKeys[ni]];
+          if (nOrig && typeof nOrig === 'object' && nSan && typeof nSan === 'object') {
+            _debugOriginals.set(nSan, nOrig);
+          }
+        }
+      }
+    }
+  }
+
+  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, __dbg, __stripErr, then scope keys
+  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals', '__dbg', '__stripErr'].concat(scopeKeys);
 
   // Always use AsyncFunction constructor (auto-async model)
   var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
@@ -640,6 +917,30 @@ function buildFunction(source, scope, opts) {
     hookState.startTime = Date.now();
     thisCell.value = undefined; // reset for each invocation
 
+    // Memory tracking: estimated total bytes allocated (upper bound, no GC tracking)
+    var memUsed = 0;
+
+    function estimateSize(val) {
+      if (val == null) return 0;
+      var t = typeof val;
+      if (t === 'string') return 40 + val.length * 2;
+      if (t === 'number' || t === 'boolean') return 16;
+      if (t === 'function') return 128;
+      if (Array.isArray(val)) return 64 + val.length * 8;
+      if (t === 'object') {
+        var keys = Object.keys(val);
+        return 64 + keys.length * 32;
+      }
+      return 16;
+    }
+
+    function trackAlloc(bytes) {
+      memUsed += bytes;
+      if (memUsed > maxMemory) {
+        throw new Error('SafeScript: estimated memory limit exceeded (' + (maxMemory / (1024 * 1024)) + ' MB)');
+      }
+    }
+
     // __check: called at top of every function and every loop iteration
     function __check() {
       if (--opsRemaining <= 0) {
@@ -653,15 +954,183 @@ function buildFunction(source, scope, opts) {
     // Build per-invocation safe globals (with fresh RNG state if seed is set)
     var invocationGlobals;
     if (seed === null) {
-      // seed: null — use true Math.random (requires env: { Random: true }, checked at compile)
       invocationGlobals = buildSafeGlobalsWithRandom(Math.random);
     } else {
-      // Deterministic RNG — fresh mulberry32 state per invocation
       invocationGlobals = buildSafeGlobalsWithRandom(mulberry32(seed));
     }
 
+    // Wrap allocation-producing safe globals with memory tracking
+    var origObjCreate = invocationGlobals.Object.create;
+    var origArrayFrom = invocationGlobals.Array.from;
+    var origArrayOf = invocationGlobals.Array.of;
+    var origJsonParse = invocationGlobals.JSON.parse;
+
+    invocationGlobals.Object = Object.freeze({
+      create: function(proto) { var r = origObjCreate(proto); trackAlloc(64); return r; },
+      keys: Object.keys, values: Object.values, entries: Object.entries,
+      assign: Object.assign, freeze: Object.freeze, isFrozen: Object.isFrozen,
+      getOwnPropertyNames: Object.getOwnPropertyNames
+    });
+    invocationGlobals.Array = Object.freeze({
+      isArray: Array.isArray,
+      from: function() { var r = origArrayFrom.apply(null, arguments); trackAlloc(estimateSize(r)); return r; },
+      of: function() { var r = origArrayOf.apply(null, arguments); trackAlloc(estimateSize(r)); return r; }
+    });
+    invocationGlobals.JSON = Object.freeze({
+      parse: function(text, reviver) { var r = origJsonParse(text, reviver); trackAlloc(estimateSize(r) + (typeof text === 'string' ? text.length : 0)); return r; },
+      stringify: JSON.stringify
+    });
+
+    // Set per-execution allowNew list
+    _allowNewCtors = allowNew;
+
+    // Create __dbg checkpoint function (no-op if not debugging)
+    var __dbg;
+    // Wrap __at/__set/__call — memory tracking always, journal routing in debug mode
+    var effectiveAt = __at;
+
+    // Memory-tracking __set: counts bytes for new property additions
+    var effectiveSet = function(obj, key, val) {
+      if (obj == null) {
+        throw new TypeError('Cannot set property "' + key + '" of ' + String(obj));
+      }
+      var k = String(key);
+      if (defs.BLOCKED_PROPS[k]) {
+        throw new TypeError('SafeScript: cannot set blocked property "' + k + '"');
+      }
+      if (!(k in obj)) {
+        trackAlloc(32 + estimateSize(val));
+      }
+      obj[k] = val;
+      return val;
+    };
+
+    // Memory-tracking __new: counts bytes for constructor result
+    var baseNew = __new;
+    var effectiveNew = function(ctor) {
+      var result = baseNew.apply(undefined, arguments);
+      trackAlloc(estimateSize(result));
+      return result;
+    };
+
+    // Memory-tracking __call wrapper: tracks results of methods that allocate
+    var ALLOC_METHODS = { map:1, filter:1, concat:1, slice:1, flat:1, flatMap:1, splice:1,
+      split:1, repeat:1, padStart:1, padEnd:1, join:1, replace:1, replaceAll:1,
+      trim:1, trimStart:1, trimEnd:1, substring:1, substr:1, toUpperCase:1, toLowerCase:1 };
+    var effectiveCall = function(obj, method) {
+      var result = __call.apply(undefined, arguments);
+      if (ALLOC_METHODS[method] && result != null) {
+        trackAlloc(estimateSize(result));
+      }
+      return result;
+    };
+    var effectiveCallOpt = function(obj, method) {
+      var result = __call_opt.apply(undefined, arguments);
+      if (ALLOC_METHODS[method] && result != null) {
+        trackAlloc(estimateSize(result));
+      }
+      return result;
+    };
+
+    if (debugSession) {
+      __dbg = debugSession.createCheckpoint();
+      var journal = debugSession.journal;
+
+      // Journal-aware __at: reads from overlay first
+      effectiveAt = function(obj, key) {
+        if (obj == null) {
+          throw new TypeError('Cannot read property "' + key + '" of ' + String(obj));
+        }
+        var k = String(key);
+        if (defs.BLOCKED_PROPS[k]) return undefined;
+        // Check journal overlay first
+        if (journal.has(obj, k)) {
+          return journal.read(obj, k);
+        }
+        return obj[k];
+      };
+
+      // Journal-aware __set: writes to journal + memory tracking
+      effectiveSet = function(obj, key, val) {
+        if (obj == null) {
+          throw new TypeError('Cannot set property "' + key + '" of ' + String(obj));
+        }
+        var k = String(key);
+        if (defs.BLOCKED_PROPS[k]) {
+          throw new TypeError('SafeScript: cannot set blocked property "' + k + '"');
+        }
+        if (!(k in obj)) {
+          trackAlloc(32 + estimateSize(val));
+        }
+        // Resolve to original object for journal tracking
+        var origObj = (_debugOriginals && _debugOriginals.has(obj)) ? _debugOriginals.get(obj) : obj;
+        // Read old value (from journal overlay or real object)
+        var oldVal = journal.has(origObj, k) ? journal.read(origObj, k) : origObj[k];
+        // Write to journal against the ORIGINAL object
+        journal.write(origObj, k, oldVal, val);
+        // Also update the sanitized copy so subsequent reads within the
+        // compiled code see the new value (without needing __at for dot access)
+        obj[k] = val;
+        // Log side effect
+        debugSession._effectLog.push({
+          kind: 'write', target: origObj, key: k, was: oldVal, to: val
+        });
+        return val;
+      };
+
+      // Journal-aware __call: logs the call as a side effect + memory tracking
+      effectiveCall = function(obj, method) {
+        var callArgs = [];
+        for (var ci = 2; ci < arguments.length; ci++) {
+          callArgs.push(arguments[ci]);
+        }
+        debugSession._effectLog.push({
+          kind: 'call', target: obj, method: method, args: callArgs
+        });
+        var result = __call.apply(undefined, arguments);
+        if (ALLOC_METHODS[method] && result != null) {
+          trackAlloc(estimateSize(result));
+        }
+        return result;
+      };
+
+      effectiveCallOpt = function(obj, method) {
+        if (obj == null) return undefined;
+        var callArgs = [];
+        for (var ci = 2; ci < arguments.length; ci++) {
+          callArgs.push(arguments[ci]);
+        }
+        debugSession._effectLog.push({
+          kind: 'call', target: obj, method: method, args: callArgs, optional: true
+        });
+        var result = __call_opt.apply(undefined, arguments);
+        if (ALLOC_METHODS[method] && result != null) {
+          trackAlloc(estimateSize(result));
+        }
+        return result;
+      };
+    } else {
+      __dbg = async function() { return null; };
+    }
+
+    // Wrap runtime guards to strip stacks on thrown errors (prevents path leaks)
+    var safeAt = function() { try { return effectiveAt.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeSet = function() { try { return effectiveSet.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCall = function() { try { return effectiveCall.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCallOpt = function() { try { return effectiveCallOpt.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeNew = function() { try { return effectiveNew.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCheck = function() { try { return __check.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+
     // Bind the arguments
-    var args = [scopeObj, __at, __set, __call, __call_opt, __check, thisCell, invocationGlobals];
+    var args = [scopeObj, safeAt, safeSet, safeCall, safeCallOpt, safeNew, safeCheck, thisCell, invocationGlobals, __dbg, __stripErr];
+
+    // Store runtime args on the debug session for edit-and-continue
+    // (compileTail needs these to build the replacement function)
+    if (debugSession) {
+      debugSession._runtimeArgs = args.slice(0); // copy
+      debugSession._compileTailFn = require('./compile').compileTail;
+    }
+
     for (var i = 0; i < scopeKeys.length; i++) {
       args.push(scopeObj[scopeKeys[i]]);
     }
@@ -675,22 +1144,36 @@ function buildFunction(source, scope, opts) {
       }
     }
 
+    // v1.4: Sanitize return value to POD (strip functions, keep data)
+    // Can be disabled with opts.rawReturn for internal/trusted use
+    var shouldSanitizeReturn = !opts.rawReturn;
+
     // Promise.race as secondary defense (catches slow async injected methods)
     if (timeout > 0) {
       var timer;
       return Promise.race([
-        promise.then(function(v) { clearTimeout(timer); cleanupDOM(); return v; },
-                     function(e) { clearTimeout(timer); cleanupDOM(); throw e; }),
+        promise.then(function(v) {
+          clearTimeout(timer); cleanupDOM(); _allowNewCtors = null;
+          return shouldSanitizeReturn ? sanitizeReturn(v) : v;
+        }, function(e) {
+          clearTimeout(timer); cleanupDOM(); _allowNewCtors = null;
+          throw _stripStack(e);
+        }),
         new Promise(function(_, reject) {
           timer = setTimeout(function() {
-            cleanupDOM();
+            cleanupDOM(); _allowNewCtors = null;
             reject(new Error('SafeScript: execution timed out after ' + timeout + 'ms'));
           }, timeout);
         })
       ]);
     }
-    return promise.then(function(v) { cleanupDOM(); return v; },
-                        function(e) { cleanupDOM(); throw e; });
+    return promise.then(function(v) {
+      cleanupDOM(); _allowNewCtors = null;
+      return shouldSanitizeReturn ? sanitizeReturn(v) : v;
+    }, function(e) {
+      cleanupDOM(); _allowNewCtors = null;
+      throw _stripStack(e);
+    });
   };
 }
 
@@ -698,6 +1181,8 @@ exports.__at = __at;
 exports.__set = __set;
 exports.__call = __call;
 exports.__call_opt = __call_opt;
+exports.__new = __new;
+exports.sanitizeReturn = sanitizeReturn;
 exports.sanitize = sanitize;
 exports.buildShadowList = buildShadowList;
 exports.buildFunction = buildFunction;
@@ -718,3 +1203,4 @@ exports.getRegisteredTypes = function() {
 };
 exports.MAX_TIMEOUT = MAX_TIMEOUT;
 exports.MAX_OPS = MAX_OPS;
+exports.MAX_MEMORY = MAX_MEMORY;

@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.1.0] — 2026-11-18
+
+### Security Hardening
+
+- **ReDoS guard.** `__call` now checks string regex methods (`match`, `test`, `exec`, `search`, `replace`, `replaceAll`, `split`, `matchAll`) for two risk factors: input strings over 100KB are rejected, and regex patterns with nested quantifiers (e.g. `(a+)+$`) are blocked at call time. Prevents exponential-time regex execution that could peg the main thread.
+
+- **Error.stack stripping.** All Error constructors provided to SafeScript code (`Error`, `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`) are wrapped so `.stack` returns only the error name and message — no server filesystem paths, no Node internals. Runtime-thrown errors (from `__at`, `__set`, `__call`, `__check`) are also stripped at the promise boundary and in catch clauses via injected `__stripErr`. Opt-in `@env debug` or `opts.exposeStack` can bypass this for development.
+
+- **Scope function toString() wrapping.** Every function passed into the scope is wrapped in a frozen passthrough that hides the host source code. `fn.toString()` returns `"function name() { [host] }"` instead of the real implementation. `toSource()` returns the same. The wrapper is `Object.freeze`d so `.safe` code cannot reassign `toString`. Function `.name` and `.length` are preserved. A `WeakMap` cache avoids double-wrapping.
+
+### Internal
+
+- Catch clauses in compiled SafeScript now inject `__stripErr(e)` at the top of the catch body, stripping stacks on native V8 errors caught inside `.safe` code (e.g. `null.foo` → TypeError with full stack → stack stripped before the catch body runs).
+- `__new` resolves through `wrapper.__original` to find the actual constructor, so `new` works correctly on scope-injected constructors that have been wrapped by the toString guard.
+- Safe Error constructors are added to `SAFE_NEW_CTORS` after `buildSafeGlobals()` so `new Error(...)` works in SafeScript code.
+- Promise rejection boundaries in `buildFunction` strip stacks via `_stripStack(e)`.
+- 36 new tests in `test-v2.1-security.js`.
+
 ## [2.0.0] — 2026-11-08
 
 ### Added

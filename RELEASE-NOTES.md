@@ -1,8 +1,28 @@
+# SafeScript 2.1 Release Notes
+
+Three security hardening fixes for the runtime. No API changes, no compiler changes (beyond catch-clause instrumentation), no migration needed.
+
+## What's New in 2.1
+
+### ReDoS Guard
+
+String regex methods (`match`, `test`, `exec`, `search`, `replace`, `replaceAll`, `split`, `matchAll`) are now checked in `__call` before dispatch. Two guards: input strings over 100KB are rejected, and regex patterns with nested quantifiers (the classic exponential-time patterns like `(a+)+$`) are blocked. About 30 lines in the runtime.
+
+### Error.stack Stripping
+
+All Error constructors in the safe globals are wrapped so `.stack` returns only the error name and message. No file paths, no Node.js internals, no line numbers from the host. Runtime-thrown errors are stripped at the promise boundary and in catch clauses (the emitter injects `__stripErr(e)` at the top of every catch body). The host sees full stacks; SafeScript code does not.
+
+### Scope Function toString() Wrapping
+
+Every function in the scope is wrapped in a frozen passthrough. `fn.toString()` returns `"function name() { [host] }"` instead of the real source. The wrapper preserves `.name`, `.length`, and call semantics. A `WeakMap` cache avoids double-wrapping.
+
+## What's Unchanged from 2.0
+
 # SafeScript 2.0 Release Notes
 
 SafeScript 2.0 turns a safe language into a development environment. The compiler, sandbox, and DOM facades from v1.x remain unchanged. What's new is a transactional runtime layered on top: every mutation goes through a journal, nothing changes until you commit, and a debug protocol lets any driver (IDE, Web Worker, remote tool) control execution from outside.
 
-## What's New
+## What's New in 2.0
 
 ### `new` Keyword (v1.4+)
 

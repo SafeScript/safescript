@@ -4,6 +4,8 @@
 
 JSON gave the world a safe way to exchange data. SafeScript does the same for computation. It's a strict subset of JavaScript — no `eval`, no globals, no prototype access — that compiles to plain JS and PHP. Open a `.safe` file and you see code that's safe to run. The compiler is ~48 KB minified (~12 KB gzipped). Ship it anywhere, verify locally, no trust needed.
 
+**v2.1** adds three security hardening fixes: a ReDoS guard that blocks dangerous regex patterns and oversized inputs, Error.stack stripping that prevents server path leaks, and scope function toString() wrapping that hides host source code. All three are small, contained changes in the runtime with no API-level impact.
+
 **v2.0** adds a transactional runtime: every mutation goes through a journal (write-ahead log with read overlay), so nothing changes until you commit. Debug mode instruments every statement with checkpoints — step through code, inspect locals, rewind to any point, edit the code while paused and continue with new logic. All of this runs inside the host application's own UI, with no browser DevTools required.
 
 ## Use Cases

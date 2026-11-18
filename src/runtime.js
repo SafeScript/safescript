@@ -24,6 +24,35 @@ var _typeRegistry = new Map();
 var SAFE_CTORS = [Error, TypeError, RangeError, SyntaxError, ReferenceError,
                   Map, Set, Date, RegExp];
 
+// ── ReDoS guard ─────────────────────────────────────────────────
+// String methods that accept a regex (or are called on a RegExp)
+var REGEX_METHODS = {
+  test: true, match: true, matchAll: true, exec: true,
+  search: true, replace: true, replaceAll: true, split: true
+};
+var REGEX_INPUT_MAX = 102400; // 100KB — no legitimate tool needs to regex-match more
+var NESTED_QUANTIFIER_RE = /(\+|\*|\?|\{[0-9,]+\})\s*\)?(\+|\*|\?|\{)/;
+
+function _checkRegexSafety(args, method) {
+  var pattern = null;
+  var input = null;
+  for (var i = 0; i < args.length; i++) {
+    var a = args[i];
+    if (a instanceof RegExp) {
+      pattern = a.source;
+    } else if (typeof a === 'string' && input === null) {
+      input = a;
+    }
+  }
+  if (input !== null && input.length > REGEX_INPUT_MAX) {
+    throw new Error('SafeScript: regex input too large (' + input.length +
+      ' chars, max ' + REGEX_INPUT_MAX + ')');
+  }
+  if (pattern && NESTED_QUANTIFIER_RE.test(pattern)) {
+    throw new Error('SafeScript: regex pattern contains nested quantifiers (ReDoS risk): /' + pattern + '/');
+  }
+}
+
 // Built-in constructors allowed with `new` — always available
 var SAFE_NEW_CTORS = [
   Map, Set, Date, RegExp,
@@ -108,6 +137,10 @@ function __call(obj, method) {
   if (t === 'string' || t === 'number' || t === 'boolean') {
     var fn = obj[method];
     if (typeof fn !== 'function') return undefined;
+    // ReDoS guard: check regex methods on strings for dangerous patterns
+    if (t === 'string' && REGEX_METHODS[method]) {
+      _checkRegexSafety(args, method);
+    }
     return fn.apply(obj, args);
   }
 
@@ -202,23 +235,26 @@ function __new(ctor, args) {
     throw new TypeError('SafeScript: new requires a constructor function');
   }
 
+  // Resolve through scope wrapper to the original constructor
+  var original = ctor.__original || ctor;
+
   // 1. Built-in safe constructors
   for (var i = 0; i < SAFE_NEW_CTORS.length; i++) {
-    if (ctor === SAFE_NEW_CTORS[i]) {
-      return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+    if (ctor === SAFE_NEW_CTORS[i] || original === SAFE_NEW_CTORS[i]) {
+      return new (Function.prototype.bind.apply(original, [null].concat(args)))();
     }
   }
 
   // 2. Host-registered types (type registry)
-  if (_typeRegistry.has(ctor)) {
-    return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+  if (_typeRegistry.has(ctor) || _typeRegistry.has(original)) {
+    return new (Function.prototype.bind.apply(original, [null].concat(args)))();
   }
 
   // 3. Host-allowed constructors (via _allowNewCtors, set per-execution)
   if (_allowNewCtors) {
     for (var j = 0; j < _allowNewCtors.length; j++) {
-      if (ctor === _allowNewCtors[j]) {
-        return new (Function.prototype.bind.apply(ctor, [null].concat(args)))();
+      if (ctor === _allowNewCtors[j] || original === _allowNewCtors[j]) {
+        return new (Function.prototype.bind.apply(original, [null].concat(args)))();
       }
     }
   }
@@ -304,9 +340,62 @@ function sanitizeReturn(val, _seen) {
  * Functions pass through (they're trusted API).
  * Handles cycles via a seen-set.
  */
+
+// ── Scope function wrapping ─────────────────────────────────────
+// Wraps scope functions so .toString()/.toSource() return "[host]"
+// instead of leaking host source code. Wrapper is frozen.
+var _wrappedFns = new WeakMap();
+function _wrapScopeFunction(fn) {
+  if (_wrappedFns.has(fn)) return _wrappedFns.get(fn);
+  var wrapper = function () { return fn.apply(this, arguments); };
+  wrapper.toString = function () { return 'function ' + (fn.name || '') + '() { [host] }'; };
+  wrapper.toSource = wrapper.toString;
+  wrapper.__original = fn; // for __new registry lookup
+  wrapper.prototype = fn.prototype; // for instanceof checks
+  Object.defineProperty(wrapper, 'length', { value: fn.length });
+  Object.defineProperty(wrapper, 'name', { value: fn.name || '' });
+  Object.freeze(wrapper);
+  _wrappedFns.set(fn, wrapper);
+  return wrapper;
+}
+
+// ── Error stack stripping ───────────────────────────────────────
+// Strips .stack from errors to prevent leaking server paths.
+function __stripErr(err) {
+  _stripStack(err);
+}
+
+function _stripStack(err) {
+  if (err && typeof err === 'object' && err.stack) {
+    try {
+      Object.defineProperty(err, 'stack', {
+        get: function () { return (err.constructor.name || 'Error') + ': ' + (err.message || ''); },
+        set: function () {},
+        configurable: true
+      });
+    } catch (e) { /* non-configurable — ignore */ }
+  }
+  return err;
+}
+
+function _makeSafeErrorCtor(NativeError) {
+  var SafeError = function (msg) {
+    var e = new NativeError(msg);
+    Object.defineProperty(e, 'stack', {
+      get: function () { return NativeError.name + ': ' + (e.message || ''); },
+      set: function () {},
+      configurable: true
+    });
+    return e;
+  };
+  SafeError.prototype = NativeError.prototype;
+  Object.defineProperty(SafeError, 'name', { value: NativeError.name });
+  return Object.freeze(SafeError);
+}
+
 function sanitize(obj, _seen) {
   if (obj === null || obj === undefined) return obj;
-  if (typeof obj === 'function') return obj;
+  if (typeof obj === 'function') return _wrapScopeFunction(obj);
   if (typeof obj !== 'object') return obj;
 
   if (!_seen) _seen = new Map();
@@ -452,12 +541,12 @@ function buildSafeGlobals() {
     stringify: JSON.stringify,
   });
 
-  // Error constructors
-  sg.Error = Error;
-  sg.TypeError = TypeError;
-  sg.RangeError = RangeError;
-  sg.SyntaxError = SyntaxError;
-  sg.ReferenceError = ReferenceError;
+  // Error constructors — wrapped to strip .stack (prevents server path leaks)
+  sg.Error = _makeSafeErrorCtor(Error);
+  sg.TypeError = _makeSafeErrorCtor(TypeError);
+  sg.RangeError = _makeSafeErrorCtor(RangeError);
+  sg.SyntaxError = _makeSafeErrorCtor(SyntaxError);
+  sg.ReferenceError = _makeSafeErrorCtor(ReferenceError);
 
   // v1.4: Built-in constructors available with `new`
   sg.Map = Map;
@@ -484,6 +573,13 @@ function buildSafeGlobals() {
 
 // Singleton — safe globals are the same for every execution (no Math.random)
 var SAFE_GLOBALS = buildSafeGlobals();
+
+// Add wrapped Error constructors to SAFE_NEW_CTORS so `new Error(...)` works
+// (the safe globals replace native Error ctors with stack-stripping wrappers)
+SAFE_NEW_CTORS.push(
+  SAFE_GLOBALS.Error, SAFE_GLOBALS.TypeError, SAFE_GLOBALS.RangeError,
+  SAFE_GLOBALS.SyntaxError, SAFE_GLOBALS.ReferenceError
+);
 
 // Names of safe globals that should be assigned in the compiled body
 var SAFE_GLOBAL_NAMES = Object.keys(SAFE_GLOBALS);
@@ -795,8 +891,8 @@ function buildFunction(source, scope, opts) {
     }
   }
 
-  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, __dbg, then scope keys
-  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals', '__dbg'].concat(scopeKeys);
+  // Function params: __scope, __at, __set, __call, __call_opt, __new, __check, __thisCell, __safeGlobals, __dbg, __stripErr, then scope keys
+  var paramNames = ['__scope', '__at', '__set', '__call', '__call_opt', '__new', '__check', '__thisCell', '__safeGlobals', '__dbg', '__stripErr'].concat(scopeKeys);
 
   // Always use AsyncFunction constructor (auto-async model)
   var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
@@ -1017,8 +1113,16 @@ function buildFunction(source, scope, opts) {
       __dbg = async function() { return null; };
     }
 
+    // Wrap runtime guards to strip stacks on thrown errors (prevents path leaks)
+    var safeAt = function() { try { return effectiveAt.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeSet = function() { try { return effectiveSet.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCall = function() { try { return effectiveCall.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCallOpt = function() { try { return effectiveCallOpt.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeNew = function() { try { return effectiveNew.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+    var safeCheck = function() { try { return __check.apply(undefined, arguments); } catch(e) { throw _stripStack(e); } };
+
     // Bind the arguments
-    var args = [scopeObj, effectiveAt, effectiveSet, effectiveCall, effectiveCallOpt, effectiveNew, __check, thisCell, invocationGlobals, __dbg];
+    var args = [scopeObj, safeAt, safeSet, safeCall, safeCallOpt, safeNew, safeCheck, thisCell, invocationGlobals, __dbg, __stripErr];
 
     // Store runtime args on the debug session for edit-and-continue
     // (compileTail needs these to build the replacement function)
@@ -1053,7 +1157,7 @@ function buildFunction(source, scope, opts) {
           return shouldSanitizeReturn ? sanitizeReturn(v) : v;
         }, function(e) {
           clearTimeout(timer); cleanupDOM(); _allowNewCtors = null;
-          throw e;
+          throw _stripStack(e);
         }),
         new Promise(function(_, reject) {
           timer = setTimeout(function() {
@@ -1068,7 +1172,7 @@ function buildFunction(source, scope, opts) {
       return shouldSanitizeReturn ? sanitizeReturn(v) : v;
     }, function(e) {
       cleanupDOM(); _allowNewCtors = null;
-      throw e;
+      throw _stripStack(e);
     });
   };
 }
